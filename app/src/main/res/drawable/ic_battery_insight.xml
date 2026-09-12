@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Battery Top Terminal Cap -->
+    <path
+        android:fillColor="@color/ic_launcher_battery_border"
+        android:pathData="M49,26 L59,26 A2,2 0 0 1 61,28 L61,30 L47,30 L47,28 A2,2 0 0 1 49,26 Z" />
+
+    <!-- Battery Inner Fill -->
+    <path
+        android:fillColor="@color/ic_launcher_battery_fill"
+        android:pathData="M45.5,32.5 L62.5,32.5 A6,6 0 0 1 68.5,38.5 L68.5,71.5 A6,6 0 0 1 62.5,77.5 L45.5,77.5 A6,6 0 0 1 39.5,71.5 L39.5,38.5 A6,6 0 0 1 45.5,32.5 Z" />
+
+    <!-- Battery Body Outer Border -->
+    <path
+        android:strokeColor="@color/ic_launcher_battery_border"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M45,29 L63,29 A9,9 0 0 1 72,38 L72,72 A9,9 0 0 1 63,81 L45,81 A9,9 0 0 1 36,72 L36,38 A9,9 0 0 1 45,29 Z" />
+
+    <!-- EKG Contrast Badge -->
+    <path
+        android:fillColor="@color/ic_launcher_ekg_badge_bg"
+        android:pathData="M61,57 L73,57 A10,10 0 0 1 83,67 L83,69 A10,10 0 0 1 73,79 L61,79 A10,10 0 0 1 51,69 L51,67 A10,10 0 0 1 61,57 Z" />
+
+    <!-- EKG Pulse Wave -->
+    <path
+        android:strokeColor="@color/ic_launcher_ekg_line"
+        android:strokeWidth="2.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M50,68 L56,68 L59,71 L64,59 L69,77 L73,68 L83,68" />
+</vector>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Classic Light Theme Colors -->
+    <color name="ic_launcher_background">#FFFFFF</color>
+    <color name="ic_launcher_battery_border">#1E8E3E</color>
+    <color name="ic_launcher_battery_fill">#34A853</color>
+    <color name="ic_launcher_ekg_line">#137333</color>
+    <color name="ic_launcher_ekg_badge_bg">#FFFFFF</color>
+
+    <!-- Monet Light Theme Colors (Default/Pre-v31 Fallback) -->
+    <color name="ic_launcher_monet_bg">#F1F3F4</color>
+    <color name="ic_launcher_monet_battery_border">#1E8E3E</color>
+    <color name="ic_launcher_monet_battery_fill">#34A853</color>
+    <color name="ic_launcher_monet_ekg_line">#137333</color>
+    <color name="ic_launcher_monet_ekg_badge_bg">#F1F3F4</color>
+</resources>

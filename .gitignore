@@ -1,0 +1,37 @@
+# Built binaries and packages
+*.apk
+*.ap_
+*.aab
+*.dex
+
+# Build output directories
+build/
+app/build/
+**/build/
+
+# Gradle cache and temporary files
+.gradle/
+
+# Local SDK and environment properties (contains machine-specific paths)
+local.properties
+
+# Android Studio / IntelliJ IDEA workspace files
+.idea/
+*.iml
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Local scratch and external reference directories
+scratch/
+
+# Legacy ROM integration files (keep standalone app clean)
+frameworks/
+packages/
+integration_diffs/
+integration_resources/
