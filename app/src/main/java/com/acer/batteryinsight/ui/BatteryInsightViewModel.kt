@@ -77,7 +77,7 @@ class BatteryInsightViewModel : ViewModel() {
     private val _lastDischargeHistory = MutableStateFlow<List<BatteryInsightHistoryBucket>>(emptyList())
     val lastDischargeHistory: StateFlow<List<BatteryInsightHistoryBucket>> = _lastDischargeHistory.asStateFlow()
 
-    private val _isLoading = MutableStateFlow(true)
+    private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     private val _isServiceConnected = MutableStateFlow(false)
@@ -128,6 +128,19 @@ class BatteryInsightViewModel : ViewModel() {
     private val _zeroCurrentAlarmEnabled = MutableStateFlow(false)
     val zeroCurrentAlarmEnabled: StateFlow<Boolean> = _zeroCurrentAlarmEnabled.asStateFlow()
 
+    // --- GitHub Releases In-App Updater State ---
+    private val _updateInfo = MutableStateFlow<AppUpdateInfo?>(null)
+    val updateInfo: StateFlow<AppUpdateInfo?> = _updateInfo.asStateFlow()
+
+    private val _updateDownloadState = MutableStateFlow<UpdateDownloadState>(UpdateDownloadState.Idle)
+    val updateDownloadState: StateFlow<UpdateDownloadState> = _updateDownloadState.asStateFlow()
+
+    private val _isCheckingUpdate = MutableStateFlow(false)
+    val isCheckingUpdate: StateFlow<Boolean> = _isCheckingUpdate.asStateFlow()
+
+    private val _updateSnackMessage = MutableStateFlow<String?>(null)
+    val updateSnackMessage: StateFlow<String?> = _updateSnackMessage.asStateFlow()
+
     private var hasLoadedSettings = false
 
     private var pollingJob: kotlinx.coroutines.Job? = null
@@ -173,18 +186,25 @@ class BatteryInsightViewModel : ViewModel() {
                 ctx.bindService(intent, serviceConnection, android.content.Context.BIND_AUTO_CREATE)
             } catch (_: Exception) {}
         }
-        try {
-            val smClass = Class.forName("android.os.ServiceManager")
-            val checkMethod = smClass.getMethod("checkService", String::class.java)
-            val binder = checkMethod.invoke(null, "battery_insight") as? android.os.IBinder
-            if (binder != null) {
-                return IBatteryInsightService.Stub.asInterface(binder).also {
-                    service = it
-                    _isServiceConnected.value = true
-                }
-            }
-        } catch (_: Exception) {}
         return null
+    }
+
+    fun pausePolling() {
+        pollingJob?.cancel()
+        pollingJob = null
+    }
+
+    fun resumePolling() {
+        startPolling()
+    }
+
+    fun refreshApps() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val s = connectService() ?: return@launch
+            try {
+                _apps.value = s.getAppUsageSinceLastCharge(40)?.toList() ?: emptyList()
+            } catch (_: Exception) {}
+        }
     }
 
     fun startPolling() {
@@ -197,13 +217,16 @@ class BatteryInsightViewModel : ViewModel() {
             } catch (_: Exception) {}
         }
         pollingJob = viewModelScope.launch {
-            _isLoading.value = true
             var tick = 0
             val startTime = System.currentTimeMillis()
             while (true) {
-                refreshData(tick)
-                if (_isServiceConnected.value || System.currentTimeMillis() - startTime > 3000) {
-                    _isLoading.value = false
+                try {
+                    refreshData(tick)
+                    if (_isServiceConnected.value || System.currentTimeMillis() - startTime > 3000) {
+                        _isLoading.value = false
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in polling loop", e)
                 }
                 tick++
                 val intervalMs = _monitorInterval.value.coerceIn(1000, 60000).toLong()
@@ -214,6 +237,7 @@ class BatteryInsightViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
+        pausePolling()
         try {
             com.acer.batteryinsight.BatteryInsightApp.instance?.unbindService(serviceConnection)
         } catch (_: Exception) {}
@@ -236,28 +260,28 @@ class BatteryInsightViewModel : ViewModel() {
             }
             _isEnabled.value = s.isEnabled
 
-            // Realtime Flow: update every 3s
+            // Realtime Flow: update every 2-3s
             if (tick % 2 == 0) {
-                _flow.value = s.getCurrentFlow(30).toList()
+                _flow.value = s.getCurrentFlow(30)?.toList() ?: emptyList()
             }
 
             // Hourly History: update every 30s
             if (tick % 20 == 0 || _history.value.isEmpty()) {
-                _history.value = s.history.toList()
+                _history.value = s.history?.toList() ?: emptyList()
             }
 
-            // App Usage: update every 20s
-            if (tick % 15 == 0 || _apps.value.isEmpty()) {
-                _apps.value = s.getAppUsageSinceLastCharge(40).toList()
+            // App Usage: only update when empty or every 60 ticks (to avoid heavy dumpsys allocations while UI is active)
+            if (_apps.value.isEmpty() || tick % 60 == 0) {
+                _apps.value = s.getAppUsageSinceLastCharge(40)?.toList() ?: emptyList()
             }
 
             // Archived Session data: update every 15s or when empty
-            if (tick % 5 == 0 || _lastChargeFlow.value.isEmpty()) {
+            if (tick % 10 == 0 || _lastChargeFlow.value.isEmpty()) {
                 try {
-                    _lastChargeFlow.value = s.getSessionFlow(1).toList()
-                    _lastChargeHistory.value = s.getSessionHistory(1).toList()
-                    _lastDischargeFlow.value = s.getSessionFlow(2).toList()
-                    _lastDischargeHistory.value = s.getSessionHistory(2).toList()
+                    _lastChargeFlow.value = s.getSessionFlow(1)?.toList() ?: emptyList()
+                    _lastChargeHistory.value = s.getSessionHistory(1)?.toList() ?: emptyList()
+                    _lastDischargeFlow.value = s.getSessionFlow(2)?.toList() ?: emptyList()
+                    _lastDischargeHistory.value = s.getSessionHistory(2)?.toList() ?: emptyList()
                 } catch (_: Exception) {}
             }
 
@@ -289,172 +313,200 @@ class BatteryInsightViewModel : ViewModel() {
     fun setEnabled(v: Boolean) {
         _isEnabled.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setEnabled(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setEnabled(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setNotifEnabled(v: Boolean) {
         _isNotifEnabled.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setNotificationEnabled(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setNotificationEnabled(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setMonitorInterval(v: Int) {
         _monitorInterval.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setMonitorInterval(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setMonitorInterval(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setAutoResetLevel(v: Int) {
         _autoResetLevel.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setAutoResetLevel(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setAutoResetLevel(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setAutoResetLevelEnabled(v: Boolean) {
         _autoResetLevelEnabled.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setAutoResetLevelEnabled(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setAutoResetLevelEnabled(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setResetOnPlugged(v: Boolean) {
         _resetOnPlugged.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setResetOnPlugged(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setResetOnPlugged(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setResetOnReboot(v: Boolean) {
         _resetOnReboot.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setResetOnReboot(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setResetOnReboot(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setBatteryAlarmEnabled(v: Boolean) {
         _batteryAlarmEnabled.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setBatteryAlarmEnabled(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setBatteryAlarmEnabled(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setBatteryLowThreshold(v: Int) {
         _batteryLowThreshold.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setBatteryLowThreshold(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setBatteryLowThreshold(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setBatteryHighThreshold(v: Int) {
         _batteryHighThreshold.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setBatteryHighThreshold(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setBatteryHighThreshold(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setAlarmFrequency(v: Int) {
         _alarmFrequency.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setAlarmFrequency(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setAlarmFrequency(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setFullChargeAlarmEnabled(v: Boolean) {
         _fullChargeAlarmEnabled.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setFullChargeAlarmEnabled(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setFullChargeAlarmEnabled(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setZeroCurrentAlarmEnabled(v: Boolean) {
         _zeroCurrentAlarmEnabled.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setZeroCurrentAlarmEnabled(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setZeroCurrentAlarmEnabled(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun setBatteryAlarmSound(uri: String?) {
         _batteryAlarmSound.value = uri
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setBatteryAlarmSound(uri)
+            try {
+                val s = connectService() ?: return@launch
+                s.setBatteryAlarmSound(uri)
+            } catch (_: Exception) {}
         }
     }
 
     fun setBatteryAlarmVibrate(v: Boolean) {
         _batteryAlarmVibrate.value = v
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.setBatteryAlarmVibrate(v)
+            try {
+                val s = connectService() ?: return@launch
+                s.setBatteryAlarmVibrate(v)
+            } catch (_: Exception) {}
         }
     }
 
     fun refreshSessionArchives() {
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
             try {
-                _lastChargeFlow.value = s.getSessionFlow(1).toList()
-                _lastChargeHistory.value = s.getSessionHistory(1).toList()
-                _lastDischargeFlow.value = s.getSessionFlow(2).toList()
-                _lastDischargeHistory.value = s.getSessionHistory(2).toList()
+                val s = connectService() ?: return@launch
+                _lastChargeFlow.value = s.getSessionFlow(1)?.toList() ?: emptyList()
+                _lastChargeHistory.value = s.getSessionHistory(1)?.toList() ?: emptyList()
+                _lastDischargeFlow.value = s.getSessionFlow(2)?.toList() ?: emptyList()
+                _lastDischargeHistory.value = s.getSessionHistory(2)?.toList() ?: emptyList()
             } catch (_: Exception) {}
         }
     }
 
     fun resetStats() {
         viewModelScope.launch(Dispatchers.IO) {
-            val s = connectService() ?: return@launch
-            s.resetStats()
-            _flow.value = emptyList()
-            _history.value = emptyList()
-            _apps.value = emptyList()
+            try {
+                val s = connectService() ?: return@launch
+                s.resetStats()
+                _flow.value = emptyList()
+                _history.value = emptyList()
+                _apps.value = emptyList()
+            } catch (_: Exception) {}
         }
     }
 
     // --- GitHub Releases In-App Updater ---
 
-    private val _updateInfo = MutableStateFlow<AppUpdateInfo?>(null)
-    val updateInfo: StateFlow<AppUpdateInfo?> = _updateInfo.asStateFlow()
-
-    private val _updateDownloadState = MutableStateFlow<UpdateDownloadState>(UpdateDownloadState.Idle)
-    val updateDownloadState: StateFlow<UpdateDownloadState> = _updateDownloadState.asStateFlow()
-
-    private val _isCheckingUpdate = MutableStateFlow(false)
-    val isCheckingUpdate: StateFlow<Boolean> = _isCheckingUpdate.asStateFlow()
-
-    private val _updateSnackMessage = MutableStateFlow<String?>(null)
-    val updateSnackMessage: StateFlow<String?> = _updateSnackMessage.asStateFlow()
-
     fun checkForUpdates(isManual: Boolean = false) {
         viewModelScope.launch {
-            _isCheckingUpdate.value = true
-            val result = UpdateManager.checkForUpdate()
-            _isCheckingUpdate.value = false
-            result.onSuccess { info ->
-                if (info.isUpdateAvailable) {
-                    _updateInfo.value = info
-                    _updateDownloadState.value = UpdateDownloadState.Idle
-                } else if (isManual) {
-                    _updateSnackMessage.value = "UP_TO_DATE"
+            try {
+                _isCheckingUpdate.value = true
+                val result = UpdateManager.checkForUpdate()
+                _isCheckingUpdate.value = false
+                result.onSuccess { info ->
+                    if (info.isUpdateAvailable) {
+                        _updateInfo.value = info
+                        _updateDownloadState.value = UpdateDownloadState.Idle
+                    } else if (isManual) {
+                        _updateSnackMessage.value = "UP_TO_DATE"
+                    }
+                }.onFailure {
+                    if (isManual) {
+                        _updateSnackMessage.value = "ERROR"
+                    }
                 }
-            }.onFailure {
+            } catch (e: Exception) {
+                Log.e(TAG, "Update check failed", e)
+                _isCheckingUpdate.value = false
                 if (isManual) {
                     _updateSnackMessage.value = "ERROR"
                 }

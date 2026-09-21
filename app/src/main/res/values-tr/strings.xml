@@ -154,8 +154,8 @@
     <string name="battery_insight_icon_current">Akım (mA)</string>
     <string name="battery_insight_icon_voltage">Voltaj</string>
     <string name="battery_insight_icon_power">Güç (W)</string>
-    <string name="battery_insight_service_unavailable">Power Insight servisi kullanılamıyor</string>
-    <string name="battery_insight_service_unavailable_summary">framework-res ve services.jar ile yeniden derleyip flash\'layın, ardından yeniden başlatın. Kontrol: service check battery_insight</string>
+    <string name="battery_insight_service_unavailable">Battery Insight servisi kullanılamıyor</string>
+    <string name="battery_insight_service_unavailable_summary">Servise bağlanılamadı. Lütfen arka plan izinlerini kontrol edip uygulamayı yeniden başlatın.</string>
     <string name="battery_insight_zero_current_alarm">0 mA Sıfır akım tam şarj bildirimi</string>
     <string name="battery_insight_zero_current_alarm_summary">Şarj olurken akım 0 mA\'ya ulaştığında (gerçek tam dolum) bildirim/alarm gönder</string>
     <string name="battery_insight_session_details">Oturum detayları</string>

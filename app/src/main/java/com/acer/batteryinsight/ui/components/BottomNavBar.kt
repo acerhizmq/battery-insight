@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -51,8 +52,11 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.acer.batteryinsight.R
@@ -78,6 +82,10 @@ fun AppBottomNavBar(
     modifier: Modifier = Modifier,
 ) {
     if (!isFloating) {
+        val density = LocalDensity.current
+        val fontScale = density.fontScale
+        val adaptiveM3FontSize = if (fontScale > 1.15f) (11f / (fontScale / 1.15f)).sp else 11.sp
+
         // Standard Material 3 Navigation Bar
         NavigationBar(
             modifier = modifier,
@@ -93,8 +101,11 @@ fun AppBottomNavBar(
                     label = {
                         Text(
                             text = label,
-                            fontSize = 12.sp,
+                            fontSize = adaptiveM3FontSize,
                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     },
                     colors = NavigationBarItemDefaults.colors(
@@ -125,6 +136,11 @@ fun KernelSUFloatingBottomBar(
     isBlurEnabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    val configuration = LocalConfiguration.current
+    val density = LocalDensity.current
+    val screenWidth = configuration.screenWidthDp.dp
+    val fontScale = density.fontScale
+
     val isDark = MaterialTheme.colorScheme.surface.let {
         (it.red * 0.299 + it.green * 0.587 + it.blue * 0.114) < 0.5
     }
@@ -168,16 +184,26 @@ fun KernelSUFloatingBottomBar(
         )
     )
 
+    // Responsive horizontal margin: smaller on compact screens to give tabs maximum space
+    val horizontalMargin = when {
+        screenWidth < 360.dp -> 6.dp
+        screenWidth < 400.dp -> 10.dp
+        else -> 16.dp
+    }
+
+    // Responsive height that gently accommodates larger font scales without clipping
+    val navBarHeight = (64f * fontScale.coerceIn(1f, 1.22f)).dp
+
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp),
+            .padding(horizontal = horizontalMargin),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(64.dp)
+                .height(navBarHeight)
                 .shadow(
                     elevation = 12.dp,
                     shape = CircleShape,
@@ -188,19 +214,37 @@ fun KernelSUFloatingBottomBar(
             color = Color.Transparent,
             border = glassBorder,
         ) {
-            androidx.compose.foundation.layout.BoxWithConstraints(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(glassContainerBg)
-                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                    .padding(horizontal = 3.dp, vertical = 3.dp),
                 contentAlignment = Alignment.CenterStart,
             ) {
                 val tabWidth = maxWidth / tabCount
+                val isCompact = tabWidth < 76.dp || fontScale > 1.15f
+                val iconSize = if (tabWidth < 68.dp) 18.dp else if (isCompact) 20.dp else 22.dp
+
+                // Adaptive font sizing based on available tab width and font scale
+                val baseFontSize = when {
+                    tabWidth < 68.dp -> 8.5.sp
+                    tabWidth < 76.dp -> 9.5.sp
+                    tabWidth < 88.dp -> 10.2.sp
+                    else -> 11.sp
+                }
+                // When system font scale is high (> 1.1f), scale the base SP so that the resulting pixel size fits cleanly
+                val effectiveFontSize = if (fontScale > 1.1f) {
+                    (baseFontSize.value / (fontScale / 1.1f)).sp
+                } else {
+                    baseFontSize
+                }
+
+                val indicatorOffsetX = (tabWidth.value * animatedIndicatorIndex).dp
 
                 // Dynamic Sliding Indicator Pill (Crystal Liquid Glass)
                 Box(
                     modifier = Modifier
-                        .offset(x = tabWidth * animatedIndicatorIndex)
+                        .offset(x = indicatorOffsetX)
                         .width(tabWidth)
                         .fillMaxHeight()
                         .clip(CircleShape)
@@ -258,21 +302,28 @@ fun KernelSUFloatingBottomBar(
                                 imageVector = item.icon,
                                 contentDescription = label,
                                 tint = textColor,
-                                modifier = Modifier.size(22.dp),
+                                modifier = Modifier.size(iconSize),
                             )
+                            Spacer(modifier = Modifier.height(if (isCompact) 1.dp else 2.dp))
                             Text(
                                 text = label,
                                 style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = 11.sp,
+                                    fontSize = effectiveFontSize,
                                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                    letterSpacing = if (tabWidth < 75.dp) (-0.3).sp else (-0.1).sp,
                                 ),
                                 color = textColor,
                                 maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
                     }
-                }
             }
         }
     }
 }
+}
+
+
+

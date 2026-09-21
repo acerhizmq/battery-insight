@@ -63,11 +63,15 @@ class MainActivity : ComponentActivity() {
         val isAmoled = prefs.getBoolean("battery_insight_amoled_mode", false)
 
         setContent {
-            BatteryInsightTheme(
-                amoledMode = isAmoled,
-                dynamicColor = true
+            androidx.compose.runtime.CompositionLocalProvider(
+                androidx.compose.ui.platform.LocalLifecycleOwner provides this
             ) {
-                BatteryInsightRoot()
+                BatteryInsightTheme(
+                    amoledMode = isAmoled,
+                    dynamicColor = true
+                ) {
+                    BatteryInsightRoot()
+                }
             }
         }
     }

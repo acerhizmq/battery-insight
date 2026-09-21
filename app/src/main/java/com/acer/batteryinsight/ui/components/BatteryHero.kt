@@ -200,7 +200,8 @@ fun BatteryHero(
                                 val py = centerOffset.y + radius * sin(angleRad).toFloat()
 
                                 // Seamless sine envelope: zero at boundaries, peaks at center, zero jump on loop
-                                val alpha = sin(u * PI.toFloat()).pow(1.4f)
+                                val rawSin = sin(u * PI.toFloat())
+                                val alpha = if (rawSin > 0f) rawSin.coerceIn(0f, 1f).pow(1.4f) else 0f
                                 val pRadius = (3.0f + (i % 3) * 0.45f).dp.toPx()
 
                                 val color = when (i % 3) {
@@ -210,12 +211,12 @@ fun BatteryHero(
                                 }
 
                                 drawCircle(
-                                    color = color.copy(alpha = alpha * 0.35f),
+                                    color = color.copy(alpha = (alpha * 0.35f).coerceIn(0f, 1f)),
                                     radius = pRadius * 1.35f,
                                     center = Offset(px, py),
                                 )
                                 drawCircle(
-                                    color = color.copy(alpha = alpha * 0.95f),
+                                    color = color.copy(alpha = (alpha * 0.95f).coerceIn(0f, 1f)),
                                     radius = pRadius,
                                     center = Offset(px, py),
                                 )
@@ -225,14 +226,14 @@ fun BatteryHero(
                             val tipRad = Math.toRadians(tipAngleDeg.toDouble())
                             val tipX = centerOffset.x + radius * cos(tipRad).toFloat()
                             val tipY = centerOffset.y + radius * sin(tipRad).toFloat()
-                            val tipPulse = (sin(animPhase * 2f * PI.toFloat()) * 0.5f + 0.5f)
+                            val tipPulse = (sin(animPhase * 2f * PI.toFloat()) * 0.5f + 0.5f).coerceIn(0f, 1f)
                             drawCircle(
-                                color = Color.White.copy(alpha = tipPulse * 0.5f),
+                                color = Color.White.copy(alpha = (tipPulse * 0.5f).coerceIn(0f, 1f)),
                                 radius = strokeWidth * 0.36f,
                                 center = Offset(tipX, tipY),
                             )
                             drawCircle(
-                                color = primaryColor.copy(alpha = tipPulse * 0.7f),
+                                color = primaryColor.copy(alpha = (tipPulse * 0.7f).coerceIn(0f, 1f)),
                                 radius = strokeWidth * 0.48f,
                                 center = Offset(tipX, tipY),
                             )
@@ -255,7 +256,8 @@ fun BatteryHero(
                                 val py = centerOffset.y + radius * sin(angleRad).toFloat()
 
                                 // Seamless sine envelope: zero at boundaries, zero jump on loop
-                                val alpha = sin(u * PI.toFloat()).pow(1.4f) * (1f - u * 0.3f)
+                                val rawSin = sin(u * PI.toFloat())
+                                val alpha = if (rawSin > 0f) (rawSin.coerceIn(0f, 1f).pow(1.4f) * (1f - u * 0.3f)).coerceIn(0f, 1f) else 0f
                                 val pRadius = (3.0f + (i % 3) * 0.45f).dp.toPx() * (1f - u * 0.2f)
 
                                 val color = when (i % 3) {
@@ -265,12 +267,12 @@ fun BatteryHero(
                                 }
 
                                 drawCircle(
-                                    color = color.copy(alpha = alpha * 0.30f),
+                                    color = color.copy(alpha = (alpha * 0.30f).coerceIn(0f, 1f)),
                                     radius = pRadius * 1.30f,
                                     center = Offset(px, py),
                                 )
                                 drawCircle(
-                                    color = color.copy(alpha = alpha * 0.85f),
+                                    color = color.copy(alpha = (alpha * 0.85f).coerceIn(0f, 1f)),
                                     radius = pRadius,
                                     center = Offset(px, py),
                                 )

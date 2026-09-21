@@ -154,8 +154,8 @@
     <string name="battery_insight_alarm_vibrate_summary">Trigger a long vibration pattern when the alarm goes off.</string>
     <string name="battery_insight_full_charge_alarm">Notify when fully charged</string>
     <string name="battery_insight_full_charge_alarm_summary">Get a notification when the battery is fully charged. Devices are usually fully charged 30mins to 1h after the device reaches 100%</string>
-    <string name="battery_insight_service_unavailable">Power Insight service unavailable</string>
-    <string name="battery_insight_service_unavailable_summary">Rebuild and flash framework-res plus services.jar, then reboot. Check with: service check battery_insight</string>
+    <string name="battery_insight_service_unavailable">Battery Insight service unavailable</string>
+    <string name="battery_insight_service_unavailable_summary">Service could not be connected. Please check background permissions or restart the app.</string>
     <string name="battery_insight_zero_current_alarm">Zero current full charge alarm</string>
     <string name="battery_insight_zero_current_alarm_summary">Send an alert when charging current drops to 0 mA (true full charge)</string>
     <string name="battery_insight_session_details">Session details</string>

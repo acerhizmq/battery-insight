@@ -101,6 +101,10 @@ object ShellUtils {
                 return f.readText().trim()
             } catch (_: Exception) {}
         }
+        // Never execute synchronous root shell commands on Android UI / Main Thread
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return null
+        }
         if (!isRootAvailable()) return null
         return try {
             val result = Shell.cmd("cat $path").exec()

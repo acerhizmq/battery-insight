@@ -54,8 +54,8 @@ fun FlowChart(
     val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
 
     val displaySamples = flow.takeLast(60)
-    val maxVal = displaySamples.maxOfOrNull { abs(it.current) }
-        ?.coerceAtLeast(100)
+    val maxVal = displaySamples.maxOfOrNull { abs(it.current.toLong()) }
+        ?.coerceIn(100L, 100000L)
         ?.toFloat()
         ?.times(1.1f)
         ?: 100f
@@ -161,7 +161,8 @@ fun FlowChart(
                             } else {
                                 width / 2
                             }
-                            val y = height - (abs(sample.current) / maxVal * height)
+                            val rawY = height - (abs(sample.current.toLong()).toFloat() / maxVal * height)
+                            val y = if (rawY.isNaN()) height else rawY.coerceIn(0f, height)
                             Offset(x, y)
                         }
 

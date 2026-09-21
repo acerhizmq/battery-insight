@@ -5,6 +5,7 @@
 
 package com.acer.batteryinsight.ui.components
 
+import android.util.LruCache
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -50,6 +51,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
 import com.acer.batteryinsight.model.BatteryInsightAppUsage
 import com.acer.batteryinsight.R
+
+private val appIconCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(120)
 
 @Composable
 fun AppUsageSummaryCard(
@@ -215,18 +218,23 @@ fun AppUsageRow(
                 val iconBitmap = remember(resolvedPkg, systemIcon) {
                     if (systemIcon != null) null
                     else {
-                        try {
-                            if (resolvedPkg.isNullOrEmpty() || resolvedPkg.startsWith("uid.")) {
-                                pm.defaultActivityIcon.toBitmap(96, 96).asImageBitmap()
-                            } else {
-                                pm.getApplicationIcon(resolvedPkg).toBitmap(96, 96).asImageBitmap()
-                            }
-                        } catch (_: Exception) {
-                            try {
-                                pm.defaultActivityIcon.toBitmap(96, 96).asImageBitmap()
+                        val key = resolvedPkg ?: "default"
+                        appIconCache.get(key) ?: run {
+                            val bmp = try {
+                                if (resolvedPkg.isNullOrEmpty() || resolvedPkg.startsWith("uid.")) {
+                                    pm.defaultActivityIcon.toBitmap(72, 72).asImageBitmap()
+                                } else {
+                                    pm.getApplicationIcon(resolvedPkg).toBitmap(72, 72).asImageBitmap()
+                                }
                             } catch (_: Exception) {
-                                null
+                                try {
+                                    pm.defaultActivityIcon.toBitmap(72, 72).asImageBitmap()
+                                } catch (_: Exception) {
+                                    null
+                                }
                             }
+                            if (bmp != null) appIconCache.put(key, bmp)
+                            bmp
                         }
                     }
                 }

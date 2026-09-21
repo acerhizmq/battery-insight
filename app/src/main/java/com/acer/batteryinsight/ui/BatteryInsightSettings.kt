@@ -35,6 +35,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -42,6 +43,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -52,7 +56,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.acer.batteryinsight.ui.components.AppUsageRow
 import com.acer.batteryinsight.ui.components.AppUsageSummaryCard
-import com.acer.batteryinsight.ui.components.BatteryHealthCard
 import com.acer.batteryinsight.ui.components.BatteryHealthDialog
 import com.acer.batteryinsight.ui.components.BatteryHero
 import com.acer.batteryinsight.ui.components.AppBottomNavBar
@@ -67,9 +70,12 @@ import com.acer.batteryinsight.ui.components.PermissionModeBottomSheet
 import com.acer.batteryinsight.ui.components.SessionDetailsSheet
 import com.acer.batteryinsight.ui.components.SettingsPanel
 import com.acer.batteryinsight.ui.components.UpdateDialog
+import com.acer.batteryinsight.ui.components.UpdateStatusDialog
 import com.acer.batteryinsight.ui.components.WelcomeSetupScreen
 import com.acer.batteryinsight.R
 import android.widget.Toast
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.LifecycleOwner
 
 @Composable
 fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
@@ -101,19 +107,52 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
     val prefs = remember { context.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE) }
     var showWelcomeScreen by remember { mutableStateOf(!prefs.getBoolean("onboarding_completed", false)) }
 
+    var updateStatusDialogInfo by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+
+    val lifecycleOwner: LifecycleOwner? = runCatching { androidx.compose.ui.platform.LocalLifecycleOwner.current }.getOrNull()
+        ?: (context as? LifecycleOwner)
+
+    lifecycleOwner?.let { owner ->
+        DisposableEffect(owner) {
+            if (owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                viewModel.resumePolling()
+            }
+            val observer = LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_START, Lifecycle.Event.ON_RESUME -> {
+                        viewModel.resumePolling()
+                    }
+                    Lifecycle.Event.ON_STOP -> {
+                        viewModel.pausePolling()
+                    }
+                    else -> {}
+                }
+            }
+            owner.lifecycle.addObserver(observer)
+            onDispose {
+                owner.lifecycle.removeObserver(observer)
+                viewModel.pausePolling()
+            }
+        }
+    }
+
+    LaunchedEffect(selectedTab) {
+        if (selectedTab == 2) {
+            viewModel.refreshApps()
+        }
+    }
+
     LaunchedEffect(updateSnackMessage) {
         updateSnackMessage?.let { msg ->
             when (msg) {
-                "UP_TO_DATE" -> Toast.makeText(
-                    context,
-                    context.getString(R.string.battery_insight_update_latest, com.acer.batteryinsight.BuildConfig.VERSION_NAME),
-                    Toast.LENGTH_SHORT
-                ).show()
-                "ERROR" -> Toast.makeText(
-                    context,
-                    context.getString(R.string.battery_insight_update_error),
-                    Toast.LENGTH_SHORT
-                ).show()
+                "UP_TO_DATE" -> {
+                    val text = context.getString(R.string.battery_insight_update_latest, com.acer.batteryinsight.BuildConfig.VERSION_NAME)
+                    updateStatusDialogInfo = Pair(false, text)
+                }
+                "ERROR" -> {
+                    val text = context.getString(R.string.battery_insight_update_error)
+                    updateStatusDialogInfo = Pair(true, text)
+                }
             }
             viewModel.clearUpdateSnackMessage()
         }
@@ -126,7 +165,12 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
         contract = ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         if (result.resultCode == android.app.Activity.RESULT_OK) {
-            val uri = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+            val uri = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                result.data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+            }
             viewModel.setBatteryAlarmSound(uri?.toString())
         }
     }
@@ -500,6 +544,14 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
                     onDismiss = { viewModel.dismissUpdateDialog() },
                     onStartDownload = { viewModel.startUpdateDownload(context) },
                     onInstall = { file -> viewModel.installDownloadedApk(context, file) }
+                )
+            }
+
+            updateStatusDialogInfo?.let { (isError, message) ->
+                UpdateStatusDialog(
+                    isError = isError,
+                    message = message,
+                    onDismiss = { updateStatusDialogInfo = null },
                 )
             }
         }

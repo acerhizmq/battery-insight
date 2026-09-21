@@ -5,6 +5,7 @@
 
 package com.acer.batteryinsight.service
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -85,7 +86,13 @@ class BatteryInsightService : Service() {
     private val mLastDischargeHistoryBuckets = CopyOnWriteArrayList<BatteryInsightHistoryBucket>()
 
     private var batteryBasePath: String = "/sys/class/power_supply/battery"
+    private var verifiedCurrentNowPath: String? = null
     private var cycleCountPath: String? = null
+    private var cachedDesignCapacity: Int = 0
+    private var cachedChargeFull: Int = 0
+    private var cachedCycleCount: Int = 0
+    private var lastStaticStatsCheckRealtime: Long = 0L
+    private val cachedAppMap = mutableMapOf<Int, Pair<String, String>>()
 
     private var isScreenOn = true
     private var isCharging = false
@@ -328,7 +335,6 @@ class BatteryInsightService : Service() {
     override fun onCreate() {
         super.onCreate()
         try {
-            instance = binder
             prefs = getSharedPreferences("battery_insight_prefs", Context.MODE_PRIVATE)
             notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             batteryManager = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
@@ -340,7 +346,6 @@ class BatteryInsightService : Service() {
                 getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
             }
 
-            detectHardwarePaths()
             createNotificationChannels()
             loadSettingsIntoStats()
             restoreSessionState()
@@ -373,18 +378,26 @@ class BatteryInsightService : Service() {
             }
             ContextCompat.registerReceiver(this, batteryReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
 
-            detectHardwarePaths()
-            fillStatsLocked()
-            ShellUtils.initRootShell { isRoot ->
-                if (isRoot) {
-                    detectHardwarePaths()
-                    applyRootImmortality()
-                    synchronized(mCurrentStats) { fillStatsLocked() }
-                }
-            }
+            instance = binder
             startForegroundSafely()
-            startMonitorLoop()
-            checkBackgroundUpdates()
+            scheduleWatchdog()
+
+            // Asynchronously detect hardware paths and initialize root in background without freezing main UI thread
+            scope.launch(Dispatchers.IO) {
+                detectHardwarePaths()
+                synchronized(mCurrentStats) { fillStatsLocked() }
+                ShellUtils.initRootShell { isRoot ->
+                    if (isRoot) {
+                        scope.launch(Dispatchers.IO) {
+                            detectHardwarePaths()
+                            applyRootImmortality()
+                            synchronized(mCurrentStats) { fillStatsLocked() }
+                        }
+                    }
+                }
+                startMonitorLoop()
+                checkBackgroundUpdates()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Fatal error during onCreate of BatteryInsightService", e)
         }
@@ -631,15 +644,27 @@ class BatteryInsightService : Service() {
         scope.launch(Dispatchers.IO) {
             try {
                 val pid = android.os.Process.myPid()
+                val pkg = packageName
                 val commands = StringBuilder()
+                // 1. OOM score adj: Minimum -1000 (Protected from LowMemoryKiller)
                 commands.append("echo -1000 > /proc/$pid/oom_score_adj 2>/dev/null; ")
-                commands.append("dumpsys deviceidle whitelist +com.acer.batteryinsight 2>/dev/null; ")
-                commands.append("cmd appops set com.acer.batteryinsight RUN_IN_BACKGROUND allow 2>/dev/null; ")
-                commands.append("cmd appops set com.acer.batteryinsight RUN_ANY_IN_BACKGROUND allow 2>/dev/null; ")
-                // Chmod 644 on power_supply nodes to enable ultra-fast direct Java reads (0.01ms)
+                commands.append("echo -17 > /proc/$pid/oom_adj 2>/dev/null; ")
+                // 2. Battery & Doze Whitelisting
+                commands.append("dumpsys deviceidle whitelist +$pkg 2>/dev/null; ")
+                commands.append("cmd deviceidle whitelist +$pkg 2>/dev/null; ")
+                // 3. Prevent process throttling / standby freezing
+                commands.append("am set-standby-bucket $pkg active 2>/dev/null; ")
+                commands.append("cmd activity set-inactive $pkg false 2>/dev/null; ")
+                // 4. Background and Autostart AppOps
+                commands.append("cmd appops set $pkg RUN_IN_BACKGROUND allow 2>/dev/null; ")
+                commands.append("cmd appops set $pkg RUN_ANY_IN_BACKGROUND allow 2>/dev/null; ")
+                commands.append("cmd appops set $pkg START_FOREGROUND allow 2>/dev/null; ")
+                commands.append("cmd appops set $pkg AUTO_START allow 2>/dev/null; ")
+                commands.append("cmd appops set $pkg BOOT_COMPLETED allow 2>/dev/null; ")
+                // 5. Chmod 644 on power_supply nodes to enable ultra-fast direct Java reads (0.01ms)
                 commands.append("chmod -R 644 /sys/class/power_supply/* 2>/dev/null; ")
                 commands.append("chmod 755 /sys/class/power_supply /sys/class/power_supply/* 2>/dev/null; ")
-                // Live SELinux policy injection for Magisk / KernelSU / APatch
+                // 6. Live SELinux policy injection for Magisk / KernelSU / APatch
                 commands.append("magiskpolicy --live 'allow untrusted_app sysfs_batteryinfo file { read open getattr }' 2>/dev/null; ")
                 commands.append("magiskpolicy --live 'allow untrusted_app sysfs file { read open getattr }' 2>/dev/null; ")
                 commands.append("supolicy --live 'allow untrusted_app sysfs_batteryinfo file { read open getattr }' 2>/dev/null; ")
@@ -648,6 +673,37 @@ class BatteryInsightService : Service() {
             } catch (e: Exception) {
                 Log.e(TAG, "Error applying root immortality", e)
             }
+        }
+    }
+
+    private fun scheduleWatchdog() {
+        try {
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val intent = Intent(this, BootReceiver::class.java).apply {
+                action = "com.acer.batteryinsight.WATCHDOG_KEEPALIVE"
+            }
+            val pendingIntent = PendingIntent.getBroadcast(
+                this,
+                9999,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val triggerAt = SystemClock.elapsedRealtime() + (5 * 60 * 1000L)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
+            } else {
+                alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
+            }
+        } catch (_: Exception) {}
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (prefs.getBoolean("battery_insight_enabled", true)) {
+            try {
+                val intent = Intent(applicationContext, BatteryInsightService::class.java)
+                ContextCompat.startForegroundService(applicationContext, intent)
+            } catch (_: Exception) {}
         }
     }
 
@@ -704,6 +760,22 @@ class BatteryInsightService : Service() {
                     break
                 }
             }
+
+            // Verify and cache single working current_now node
+            val currentCandidates = listOf(
+                "$batteryBasePath/current_now",
+                "/sys/class/power_supply/bms/current_now",
+                "/sys/class/power_supply/sec-battery/current_now",
+                "/sys/class/power_supply/battery/current_now"
+            )
+            for (path in currentCandidates) {
+                val v = readSysfsInt(path)
+                if (v != 0) {
+                    verifiedCurrentNowPath = path
+                    break
+                }
+            }
+
             val possibleCycles = listOf(
                 "$batteryBasePath/cycle_count",
                 "$batteryBasePath/battery_cycle_count",
@@ -712,12 +784,71 @@ class BatteryInsightService : Service() {
                 "/sys/class/power_supply/sec-battery/cycle_count"
             )
             for (path in possibleCycles) {
-                val f = File(path)
-                if (f.exists() || ShellUtils.readSysfsSync(path) != null) {
+                val v = readSysfsInt(path)
+                if (v > 0) {
                     cycleCountPath = path
+                    cachedCycleCount = v
                     break
                 }
             }
+
+            refreshStaticBatteryInfo()
+        } catch (_: Exception) {}
+    }
+
+    private fun refreshStaticBatteryInfo() {
+        try {
+            if (cachedDesignCapacity <= 0) {
+                val designCandidates = listOf(
+                    "$batteryBasePath/charge_full_design",
+                    "/sys/class/power_supply/bms/charge_full_design",
+                    "$batteryBasePath/charge_design",
+                    "$batteryBasePath/design_capacity",
+                    "/sys/class/power_supply/battery/charge_full_design"
+                )
+                for (path in designCandidates) {
+                    var v = readSysfsInt(path)
+                    if (v > 0) {
+                        if (v > 25000) v /= 1000
+                        cachedDesignCapacity = v
+                        break
+                    }
+                }
+                if (cachedDesignCapacity <= 0) {
+                    try {
+                        val powerProfileClass = Class.forName("com.android.internal.os.PowerProfile")
+                        val powerProfile = powerProfileClass.getConstructor(Context::class.java).newInstance(this)
+                        val getBatteryCapacity = powerProfileClass.getMethod("getBatteryCapacity")
+                        val cap = (getBatteryCapacity.invoke(powerProfile) as? Double)?.toInt() ?: 0
+                        if (cap in 800..25000) {
+                            cachedDesignCapacity = cap
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            val fullCandidates = listOf(
+                "$batteryBasePath/charge_full",
+                "/sys/class/power_supply/bms/charge_full",
+                "$batteryBasePath/charge_counter",
+                "/sys/class/power_supply/battery/charge_full"
+            )
+            for (path in fullCandidates) {
+                var v = readSysfsInt(path)
+                if (v > 0) {
+                    if (v > 25000) v /= 1000
+                    cachedChargeFull = v
+                    break
+                }
+            }
+
+            val cPath = cycleCountPath
+            if (cPath != null) {
+                val v = readSysfsInt(cPath)
+                if (v > 0) cachedCycleCount = v
+            }
+
+            lastStaticStatsCheckRealtime = SystemClock.elapsedRealtime()
         } catch (_: Exception) {}
     }
 
@@ -890,22 +1021,13 @@ class BatteryInsightService : Service() {
             mCurrentStats.chargeRate = 0f
         }
 
-        // 1. Hardware Fuelgauge Current: Prioritize real sysfs hardware reading
-        val curRaw = readSysfsInt("$batteryBasePath/current_now")
+        // 1. Hardware Fuelgauge Current: Prioritize verified sysfs hardware reading
+        val curPath = verifiedCurrentNowPath
+        val curRaw = if (curPath != null) readSysfsInt(curPath) else 0
         val currentNowUa = if (curRaw != 0) {
             curRaw
         } else {
-            val bmsRaw = readSysfsInt("/sys/class/power_supply/bms/current_now")
-            if (bmsRaw != 0) {
-                bmsRaw
-            } else {
-                val secRaw = readSysfsInt("/sys/class/power_supply/sec-battery/current_now")
-                if (secRaw != 0) {
-                    secRaw
-                } else {
-                    try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) } catch (_: Exception) { 0 }
-                }
-            }
+            try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) } catch (_: Exception) { 0 }
         }
         val rawCurrentMa = if (abs(currentNowUa) > 10000) currentNowUa / 1000 else currentNowUa
         val currentNowMa = if (isCharging || isPlugged) {
@@ -933,40 +1055,17 @@ class BatteryInsightService : Service() {
 
         mCurrentStats.powerWatts = (abs(currentNowMa) * mCurrentStats.voltage) / 1000000f
 
-        // 2. Hardware Battery Capacity & Health: Sysfs with reflection fallback
-        var capDesign = readSysfsInt("$batteryBasePath/charge_full_design")
-        if (capDesign == 0) capDesign = readSysfsInt("/sys/class/power_supply/bms/charge_full_design")
-        if (capDesign == 0) capDesign = readSysfsInt("$batteryBasePath/charge_design")
-        if (capDesign == 0) capDesign = readSysfsInt("$batteryBasePath/design_capacity")
-        if (capDesign == 0) capDesign = readSysfsInt("/sys/class/power_supply/battery/charge_full_design")
-        if (capDesign > 25000) capDesign /= 1000
-
-        var capFull = readSysfsInt("$batteryBasePath/charge_full")
-        if (capFull == 0) capFull = readSysfsInt("/sys/class/power_supply/bms/charge_full")
-        if (capFull == 0) capFull = readSysfsInt("$batteryBasePath/charge_counter")
-        if (capFull == 0) capFull = readSysfsInt("/sys/class/power_supply/battery/charge_full")
-        if (capFull > 25000) capFull /= 1000
-
-        var cycles = if (cycleCountPath != null) readSysfsInt(cycleCountPath!!) else readSysfsInt("$batteryBasePath/cycle_count")
-        if (cycles == 0) cycles = readSysfsInt("/sys/class/power_supply/bms/cycle_count")
-        if (cycles == 0) cycles = readSysfsInt("$batteryBasePath/battery_cycle_count")
-        if (cycles == 0) cycles = readSysfsInt("/sys/class/power_supply/battery/cycle_count")
-        mCurrentStats.cycleCount = cycles
-
-        // Fallback 1: Framework PowerProfile for real device design capacity
-        if (capDesign <= 0) {
-            try {
-                val powerProfileClass = Class.forName("com.android.internal.os.PowerProfile")
-                val powerProfile = powerProfileClass.getConstructor(Context::class.java).newInstance(this)
-                val getBatteryCapacity = powerProfileClass.getMethod("getBatteryCapacity")
-                val cap = (getBatteryCapacity.invoke(powerProfile) as? Double)?.toInt() ?: 0
-                if (cap in 800..25000) {
-                    capDesign = cap
-                }
-            } catch (_: Exception) {}
+        // 2. Hardware Battery Capacity & Health: Use cached static properties, refresh periodically
+        if (nowRealtime - lastStaticStatsCheckRealtime > 300000L || cachedDesignCapacity <= 0 || cachedChargeFull <= 0) {
+            refreshStaticBatteryInfo()
         }
 
-        // Fallback 2: Hardware Charge Counter for current full capacity estimation
+        var capDesign = cachedDesignCapacity
+        var capFull = cachedChargeFull
+        var cycles = cachedCycleCount
+        mCurrentStats.cycleCount = cycles
+
+        // Fallback: Hardware Charge Counter for current full capacity estimation
         if (capFull <= 0) {
             val ccUah = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) } catch (_: Exception) { 0 }
             if (ccUah > 0) {
@@ -1057,13 +1156,14 @@ class BatteryInsightService : Service() {
                         saveSessionArchives()
                     }
 
+                    // Periodic re-assertion of root immortality and watchdog keep-alive
+                    if (loopCount % 15 == 0) {
+                        ShellUtils.exec("echo -1000 > /proc/${android.os.Process.myPid()}/oom_score_adj 2>/dev/null")
+                    }
+
                     if (loopCount % 300 == 0) {
-                        scope.launch(Dispatchers.IO) {
-                            try {
-                                fetchAppUsages()
-                                applyRootImmortality()
-                            } catch (_: Exception) {}
-                        }
+                        scheduleWatchdog()
+                        applyRootImmortality()
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in monitor loop", e)
@@ -1112,27 +1212,29 @@ class BatteryInsightService : Service() {
     private suspend fun fetchAppUsages() = withContext(Dispatchers.IO) {
         try {
             val pm = packageManager
-            val appMap = mutableMapOf<Int, Pair<String, String>>()
-            try {
-                val installed = pm.getInstalledApplications(0)
-                for (info in installed) {
-                    val label = try { pm.getApplicationLabel(info).toString() } catch (_: Exception) { info.packageName }
-                    appMap[info.uid] = Pair(info.packageName, label)
-                }
-            } catch (_: Exception) {}
+            val appMap = cachedAppMap
+            if (appMap.isEmpty()) {
+                try {
+                    val installed = pm.getInstalledApplications(0)
+                    for (info in installed) {
+                        val label = try { pm.getApplicationLabel(info).toString() } catch (_: Exception) { info.packageName }
+                        appMap[info.uid] = Pair(info.packageName, label)
+                    }
+                } catch (_: Exception) {}
 
-            // Predefined system services
-            appMap[0] = Pair("kernel", getString(R.string.battery_insight_process_kernel))
-            appMap[1000] = Pair("android", getString(R.string.battery_insight_process_android))
-            appMap[1001] = Pair("com.android.phone", getString(R.string.battery_insight_process_phone))
-            appMap[1073] = Pair("com.android.phone", getString(R.string.battery_insight_process_phone))
-            appMap[1002] = Pair("com.android.bluetooth", "Bluetooth")
-            appMap[1041] = Pair("audioserver", getString(R.string.battery_insight_process_audio))
-            appMap[1040] = Pair("cameraserver", getString(R.string.battery_insight_process_camera))
-            appMap[1013] = Pair("mediaserver", getString(R.string.battery_insight_process_media))
-            appMap[1046] = Pair("mediaextractor", getString(R.string.battery_insight_process_mediaextractor))
-            appMap[1047] = Pair("mediacodec", getString(R.string.battery_insight_process_mediacodec))
-            appMap[9999] = Pair("nobody", getString(R.string.battery_insight_process_unknown))
+                // Predefined system services
+                appMap[0] = Pair("kernel", getString(R.string.battery_insight_process_kernel))
+                appMap[1000] = Pair("android", getString(R.string.battery_insight_process_android))
+                appMap[1001] = Pair("com.android.phone", getString(R.string.battery_insight_process_phone))
+                appMap[1073] = Pair("com.android.phone", getString(R.string.battery_insight_process_phone))
+                appMap[1002] = Pair("com.android.bluetooth", "Bluetooth")
+                appMap[1041] = Pair("audioserver", getString(R.string.battery_insight_process_audio))
+                appMap[1040] = Pair("cameraserver", getString(R.string.battery_insight_process_camera))
+                appMap[1013] = Pair("mediaserver", getString(R.string.battery_insight_process_media))
+                appMap[1046] = Pair("mediaextractor", getString(R.string.battery_insight_process_mediaextractor))
+                appMap[1047] = Pair("mediacodec", getString(R.string.battery_insight_process_mediacodec))
+                appMap[9999] = Pair("nobody", getString(R.string.battery_insight_process_unknown))
+            }
 
             val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? android.app.usage.UsageStatsManager
             val fgTimeMap = mutableMapOf<String, Long>()
@@ -1149,9 +1251,10 @@ class BatteryInsightService : Service() {
                 }
             } catch (_: Exception) {}
 
-            var lines = ShellUtils.exec("dumpsys batterystats --charged")
-            if (lines.none { it.contains("Estimated power use", ignoreCase = true) }) {
-                lines = ShellUtils.exec("dumpsys batterystats")
+            // Streamlined dumpsys: filter in shell to prevent massive 50MB string allocations
+            var lines = ShellUtils.exec("dumpsys batterystats --charged | grep -E -A 120 'Estimated (power|battery) use' || dumpsys batterystats --charged")
+            if (lines.none { it.contains("Estimated", ignoreCase = true) }) {
+                lines = ShellUtils.exec("dumpsys batterystats | grep -E -A 120 'Estimated (power|battery) use' || dumpsys batterystats")
             }
 
             fun parseDurationMs(durationStr: String): Long {
@@ -1725,6 +1828,23 @@ class BatteryInsightService : Service() {
             saveSessionState()
             unregisterReceiver(batteryReceiver)
         } catch (_: Exception) {}
+
+        // If destroyed unexpectedly, arm revive alarm
+        if (prefs.getBoolean("battery_insight_enabled", true)) {
+            try {
+                val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+                val intent = Intent(this, BootReceiver::class.java).apply {
+                    action = "com.acer.batteryinsight.WATCHDOG_KEEPALIVE"
+                }
+                val pendingIntent = PendingIntent.getBroadcast(
+                    this,
+                    9999,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                alarmManager?.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000L, pendingIntent)
+            } catch (_: Exception) {}
+        }
         super.onDestroy()
     }
 }

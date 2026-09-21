@@ -18,9 +18,11 @@ class BatteryInsightApp : Application() {
         super.onCreate()
         instance = this
 
-        // Catch uncaught exceptions gracefully
+        // Catch uncaught exceptions gracefully and delegate to system handler
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             android.util.Log.e("BatteryInsightApp", "Uncaught exception in thread ${thread.name}", throwable)
+            defaultHandler?.uncaughtException(thread, throwable)
         }
 
         // Set up LibSU root shell builder
