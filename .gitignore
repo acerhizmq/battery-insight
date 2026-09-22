@@ -29,6 +29,8 @@ Thumbs.db
 
 # Local scratch and external reference directories
 scratch/
+.vscode/
+*.jpg
 
 # Legacy ROM integration files (keep standalone app clean)
 frameworks/

@@ -5,6 +5,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -41,9 +43,14 @@ object UpdateManager {
     const val NOTIFICATION_ID_UPDATE = 3001
     const val EXTRA_CHECK_UPDATE = "com.acer.batteryinsight.CHECK_UPDATE"
 
+    const val CHECK_INTERVAL_MS = 24 * 3600 * 1000L // 24 Hours
+
     private const val PREFS_NAME = "battery_insight_updates_prefs"
     private const val KEY_LAST_CHECK_TIME = "last_check_time"
     private const val KEY_IGNORED_VERSION = "ignored_version"
+    private const val KEY_CACHED_UPDATE_JSON = "cached_update_json"
+    private const val KEY_LAST_NOTIFIED_VERSION = "last_notified_version"
+    private const val KEY_LAST_NOTIFIED_TIME = "last_notified_time"
 
     suspend fun checkForUpdate(currentVersion: String = BuildConfig.VERSION_NAME): Result<AppUpdateInfo> =
         withContext(Dispatchers.IO) {
@@ -208,7 +215,68 @@ object UpdateManager {
         context.startActivity(installIntent)
     }
 
+    fun isNetworkAvailable(context: Context): Boolean {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return true
+            val network = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(network) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    fun cacheUpdateInfo(context: Context, info: AppUpdateInfo) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val json = JSONObject().apply {
+            put("latestVersion", info.latestVersion)
+            put("releaseTitle", info.releaseTitle)
+            put("changelog", info.changelog)
+            put("downloadUrl", info.downloadUrl ?: "")
+            put("apkSize", info.apkSize)
+            put("isUpdateAvailable", info.isUpdateAvailable)
+        }
+        prefs.edit().putString(KEY_CACHED_UPDATE_JSON, json.toString()).apply()
+    }
+
+    fun getCachedUpdateInfo(context: Context): AppUpdateInfo? {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val jsonStr = prefs.getString(KEY_CACHED_UPDATE_JSON, null) ?: return null
+        return try {
+            val json = JSONObject(jsonStr)
+            val downloadUrl = json.optString("downloadUrl", "").ifEmpty { null }
+            AppUpdateInfo(
+                latestVersion = json.getString("latestVersion"),
+                releaseTitle = json.getString("releaseTitle"),
+                changelog = json.getString("changelog"),
+                downloadUrl = downloadUrl,
+                apkSize = json.getLong("apkSize"),
+                isUpdateAvailable = json.getBoolean("isUpdateAvailable")
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun clearCachedUpdateInfo(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().remove(KEY_CACHED_UPDATE_JSON).apply()
+    }
+
     fun showUpdateNotification(context: Context, updateInfo: AppUpdateInfo) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val lastNotifiedVer = prefs.getString(KEY_LAST_NOTIFIED_VERSION, null)
+        val lastNotifiedTime = prefs.getLong(KEY_LAST_NOTIFIED_TIME, 0L)
+        val now = System.currentTimeMillis()
+
+        // Suppress repeated notifications for the same version if alerted within CHECK_INTERVAL_MS (24h)
+        if (lastNotifiedVer == updateInfo.latestVersion && (now - lastNotifiedTime) < CHECK_INTERVAL_MS) {
+            return
+        }
+
+        // Cache update info for instant opening
+        cacheUpdateInfo(context, updateInfo)
+
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -224,7 +292,8 @@ object UpdateManager {
         }
 
         val launchIntent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            action = Intent.ACTION_VIEW
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_CHECK_UPDATE, true)
         }
 
@@ -252,14 +321,20 @@ object UpdateManager {
             .build()
 
         notificationManager.notify(NOTIFICATION_ID_UPDATE, notification)
+
+        // Record last notification state
+        prefs.edit()
+            .putString(KEY_LAST_NOTIFIED_VERSION, updateInfo.latestVersion)
+            .putLong(KEY_LAST_NOTIFIED_TIME, now)
+            .apply()
     }
 
     fun shouldCheckBackground(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val lastCheck = prefs.getLong(KEY_LAST_CHECK_TIME, 0L)
         val now = System.currentTimeMillis()
-        // Check once every 12 hours max in background
-        return (now - lastCheck) > 12 * 3600 * 1000L
+        // Check once every 24 hours in background
+        return (now - lastCheck) >= CHECK_INTERVAL_MS
     }
 
     fun recordCheckTime(context: Context) {

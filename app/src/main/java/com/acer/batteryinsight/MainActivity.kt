@@ -6,6 +6,7 @@
 package com.acer.batteryinsight
 
 import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -15,16 +16,21 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
 import com.acer.batteryinsight.ui.BatteryInsightRoot
+import com.acer.batteryinsight.ui.BatteryInsightViewModel
 import com.acer.batteryinsight.service.BatteryInsightService
 import com.acer.batteryinsight.ui.theme.BatteryInsightTheme
+import com.acer.batteryinsight.updater.UpdateManager
 import com.acer.batteryinsight.utils.ShellUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+
+    private val viewModel: BatteryInsightViewModel by viewModels()
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -60,6 +66,8 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        handleUpdateIntent(intent)
+
         val isAmoled = prefs.getBoolean("battery_insight_amoled_mode", false)
 
         setContent {
@@ -70,9 +78,27 @@ class MainActivity : ComponentActivity() {
                     amoledMode = isAmoled,
                     dynamicColor = true
                 ) {
-                    BatteryInsightRoot()
+                    BatteryInsightRoot(viewModel = viewModel)
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUpdateIntent(intent)
+    }
+
+    private fun handleUpdateIntent(intent: Intent?) {
+        try {
+            if (intent?.getBooleanExtra(UpdateManager.EXTRA_CHECK_UPDATE, false) == true) {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                nm?.cancel(UpdateManager.NOTIFICATION_ID_UPDATE)
+                viewModel.onNotificationClickedForUpdate(this)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "Error handling update intent", e)
         }
     }
 

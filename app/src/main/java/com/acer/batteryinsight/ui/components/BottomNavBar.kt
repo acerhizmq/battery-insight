@@ -133,7 +133,7 @@ fun AppBottomNavBar(
 fun KernelSUFloatingBottomBar(
     selectedTab: Int,
     onTabSelected: (Int) -> Unit,
-    isBlurEnabled: Boolean,
+    @Suppress("UNUSED_PARAMETER") isBlurEnabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val configuration = LocalConfiguration.current

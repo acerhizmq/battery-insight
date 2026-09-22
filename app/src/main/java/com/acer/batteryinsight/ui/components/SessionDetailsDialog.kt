@@ -249,10 +249,19 @@ fun SessionDetailsContent(
                 val soffMa = if (soffHours >= 0.016f && soffMah > 0) (soffMah / soffHours).toInt() else 0
 
                 val totalSoffTime = max(1L, stats.screenOffTime)
-                val deepSleepPct = ((stats.deepSleepTime.toFloat() / totalSoffTime) * 100f).coerceIn(0f, 100f)
-                val awakePct = ((stats.awakeTime.toFloat() / totalSoffTime) * 100f).coerceIn(0f, 100f)
-                val deepSleepMah = ((stats.deepSleepTime.toFloat() / totalSoffTime) * soffMah).toInt()
-                val awakeMah = ((stats.awakeTime.toFloat() / totalSoffTime) * soffMah).toInt()
+                val hasSoff = stats.screenOffTime >= 60000L
+                val deepSleepPct = if (hasSoff && stats.deepSleepTime > 0L) {
+                    ((stats.deepSleepTime.toFloat() / totalSoffTime) * 100f).coerceIn(0f, 100f)
+                } else 0f
+                val awakePct = if (hasSoff && stats.awakeTime > 0L) {
+                    ((stats.awakeTime.toFloat() / totalSoffTime) * 100f).coerceIn(0f, 100f)
+                } else 0f
+                val deepSleepMah = if (hasSoff && stats.deepSleepTime > 0L) {
+                    ((stats.deepSleepTime.toFloat() / totalSoffTime) * soffMah).toInt()
+                } else 0
+                val awakeMah = if (hasSoff && stats.awakeTime > 0L) {
+                    ((stats.awakeTime.toFloat() / totalSoffTime) * soffMah).toInt()
+                } else 0
 
                 Column(verticalArrangement = Arrangement.spacedBy(22.dp)) {
                     // Section 1: Total time

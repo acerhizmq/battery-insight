@@ -50,12 +50,13 @@ if (isBuildingApk && !alreadyBumped) {
 
 android {
     namespace = "com.acer.batteryinsight"
-    compileSdk = 34
+    compileSdk = 37
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "com.acer.batteryinsight"
         minSdk = 29
-        targetSdk = 34
+        targetSdk = 37
         versionCode = currentVersionCode
         versionName = currentVersionName
 

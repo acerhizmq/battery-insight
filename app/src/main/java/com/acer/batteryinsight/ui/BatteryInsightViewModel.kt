@@ -33,6 +33,8 @@ class BatteryInsightViewModel : ViewModel() {
 
     private var service: IBatteryInsightService? = null
 
+    private var lastValidLevel: Int = 100
+
     private fun createInitialStats(): BatteryInsightStats {
         val stats = BatteryInsightStats()
         try {
@@ -43,8 +45,10 @@ class BatteryInsightViewModel : ViewModel() {
                 val rawLevel = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
                 val rawScale = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
                 val pct = if (rawLevel >= 0 && rawScale > 0) ((rawLevel * 100) / rawScale) else -1
-                val validLevel = if (pct in 1..100) pct else (bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 100)
-                stats.level = if (validLevel in 1..100) validLevel else 100
+                val validLevel = if (pct in 1..100) pct else (bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1)
+                val finalLevel = if (validLevel in 1..100) validLevel else 100
+                stats.level = finalLevel
+                lastValidLevel = finalLevel
                 stats.isCharging = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) == android.os.BatteryManager.BATTERY_STATUS_CHARGING
                 stats.voltage = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_VOLTAGE, 4000) ?: 4000
                 stats.temp = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 300) ?: 300
@@ -146,13 +150,17 @@ class BatteryInsightViewModel : ViewModel() {
     private var pollingJob: kotlinx.coroutines.Job? = null
 
     init {
-        val ctx = com.acer.batteryinsight.BatteryInsightApp.instance
-        val prefs = ctx?.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE)
-        if (prefs?.getBoolean("onboarding_completed", false) == true) {
-            com.acer.batteryinsight.utils.ShellUtils.initRootShell()
-            startPolling()
+        try {
+            val ctx = com.acer.batteryinsight.BatteryInsightApp.instance
+            val prefs = ctx?.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE)
+            if (prefs?.getBoolean("onboarding_completed", false) == true) {
+                com.acer.batteryinsight.utils.ShellUtils.initRootShell()
+                startPolling()
+            }
+            checkForUpdates(isManual = false)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing ViewModel", e)
         }
-        checkForUpdates(isManual = false)
     }
 
     private val serviceConnection = object : android.content.ServiceConnection {
@@ -253,8 +261,10 @@ class BatteryInsightViewModel : ViewModel() {
         try {
             val currentStats = s.batteryState
             if (currentStats != null) {
-                if (currentStats.level <= 0 && _stats.value.level > 0) {
-                    currentStats.level = _stats.value.level
+                if (currentStats.level in 1..100) {
+                    lastValidLevel = currentStats.level
+                } else {
+                    currentStats.level = lastValidLevel
                 }
                 _stats.value = currentStats
             }
@@ -489,6 +499,13 @@ class BatteryInsightViewModel : ViewModel() {
     fun checkForUpdates(isManual: Boolean = false) {
         viewModelScope.launch {
             try {
+                val ctx = com.acer.batteryinsight.BatteryInsightApp.instance
+                if (ctx != null && !UpdateManager.isNetworkAvailable(ctx)) {
+                    if (isManual) {
+                        _updateSnackMessage.value = "ERROR"
+                    }
+                    return@launch
+                }
                 _isCheckingUpdate.value = true
                 val result = UpdateManager.checkForUpdate()
                 _isCheckingUpdate.value = false
@@ -511,6 +528,20 @@ class BatteryInsightViewModel : ViewModel() {
                     _updateSnackMessage.value = "ERROR"
                 }
             }
+        }
+    }
+
+    fun onNotificationClickedForUpdate(context: Context) {
+        try {
+            val cached = UpdateManager.getCachedUpdateInfo(context)
+            if (cached != null && cached.isUpdateAvailable) {
+                _updateInfo.value = cached
+                _updateDownloadState.value = UpdateDownloadState.Idle
+            } else {
+                checkForUpdates(isManual = false)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed handling notification update click", e)
         }
     }
 

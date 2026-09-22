@@ -33,6 +33,7 @@ import com.acer.batteryinsight.model.BatteryInsightFlowSample
 import com.acer.batteryinsight.model.BatteryInsightHistoryBucket
 import com.acer.batteryinsight.model.BatteryInsightStats
 import com.acer.batteryinsight.service.IBatteryInsightService
+import com.acer.batteryinsight.updater.UpdateManager
 import com.acer.batteryinsight.MainActivity
 import com.acer.batteryinsight.R
 import com.acer.batteryinsight.utils.ShellUtils
@@ -129,6 +130,10 @@ class BatteryInsightService : Service() {
 
     private var lastScreenStateChangeRealtime = SystemClock.elapsedRealtime()
     private var lastScreenStateChangeUptime = SystemClock.uptimeMillis()
+
+    private var lastSessionSaveTime = 0L
+    private var lastOomScoreTime = 0L
+    private var lastWatchdogTime = 0L
 
     // Current tracking
     private var minCurrent = Int.MAX_VALUE
@@ -279,14 +284,15 @@ class BatteryInsightService : Service() {
                     Intent.ACTION_POWER_CONNECTED -> {
                         val nowRealtime = SystemClock.elapsedRealtime()
                         val nowUptime = SystemClock.uptimeMillis()
-                        val deltaRt = nowRealtime - lastScreenStateChangeRealtime
-                        val deltaUp = nowUptime - lastScreenStateChangeUptime
+                        val deltaRt = max(0L, nowRealtime - lastScreenStateChangeRealtime)
+                        val deltaUp = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRt)
+                        val deltaDs = max(0L, deltaRt - deltaUp)
                         if (isScreenOn) {
                             accumScreenOnMs += deltaRt
                         } else {
                             accumScreenOffMs += deltaRt
                             accumAwakeMs += deltaUp
-                            accumDeepSleepMs += max(0L, deltaRt - deltaUp)
+                            accumDeepSleepMs += deltaDs
                         }
                         lastScreenStateChangeRealtime = nowRealtime
                         lastScreenStateChangeUptime = nowUptime
@@ -301,16 +307,24 @@ class BatteryInsightService : Service() {
                     Intent.ACTION_POWER_DISCONNECTED -> {
                         val nowRealtime = SystemClock.elapsedRealtime()
                         val nowUptime = SystemClock.uptimeMillis()
-                        val deltaRt = nowRealtime - lastScreenStateChangeRealtime
+                        val deltaRt = max(0L, nowRealtime - lastScreenStateChangeRealtime)
+                        val deltaUp = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRt)
+                        val deltaDs = max(0L, deltaRt - deltaUp)
                         if (isScreenOn) {
+                            accumScreenOnMs += deltaRt
                             accumChargeScreenOnMs += deltaRt
                         } else {
+                            accumScreenOffMs += deltaRt
+                            accumAwakeMs += deltaUp
+                            accumDeepSleepMs += deltaDs
                             accumChargeScreenOffMs += deltaRt
                         }
                         lastScreenStateChangeRealtime = nowRealtime
                         lastScreenStateChangeUptime = nowUptime
 
                         isPlugged = false
+                        zeroCurrentSustainCount = 0
+                        lastZeroCurrentNotifiedTime = 0L
                         synchronized(mCurrentStats) {
                             mCurrentStats.chargeScreenOnTime = accumChargeScreenOnMs
                             mCurrentStats.chargeScreenOffTime = accumChargeScreenOffMs
@@ -356,18 +370,14 @@ class BatteryInsightService : Service() {
             val rawScale = stickyBattery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
             val accuratePct = if (rawLevel >= 0 && rawScale > 0) ((rawLevel * 100) / rawScale) else -1
 
-            if (accuratePct in 1..100) {
-                mCurrentStats.level = accuratePct
-                lastBatteryLevel = accuratePct
-            } else {
-                val initialCapacity = try {
-                    batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-                } catch (_: Exception) { -1 }
-                if (initialCapacity in 1..100) {
-                    mCurrentStats.level = initialCapacity
-                    lastBatteryLevel = initialCapacity
-                }
-            }
+            val initialValidLevel = resolveValidBatteryLevel(accuratePct)
+            mCurrentStats.level = initialValidLevel
+            lastBatteryLevel = initialValidLevel
+
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            isScreenOn = powerManager?.isInteractive ?: true
+            lastScreenStateChangeRealtime = SystemClock.elapsedRealtime()
+            lastScreenStateChangeUptime = SystemClock.uptimeMillis()
 
             val filter = IntentFilter().apply {
                 addAction(Intent.ACTION_BATTERY_CHANGED)
@@ -403,16 +413,20 @@ class BatteryInsightService : Service() {
         }
     }
 
-    private fun checkBackgroundUpdates() {
+    private fun checkBackgroundUpdates(delayMs: Long = 15000L) {
         scope.launch(Dispatchers.IO) {
-            delay(15000)
-            if (com.acer.batteryinsight.updater.UpdateManager.shouldCheckBackground(this@BatteryInsightService)) {
-                val res = com.acer.batteryinsight.updater.UpdateManager.checkForUpdate()
-                res.onSuccess { info ->
-                    com.acer.batteryinsight.updater.UpdateManager.recordCheckTime(this@BatteryInsightService)
-                    if (info.isUpdateAvailable) {
-                        com.acer.batteryinsight.updater.UpdateManager.showUpdateNotification(this@BatteryInsightService, info)
-                    }
+            if (delayMs > 0) delay(delayMs)
+            if (!UpdateManager.shouldCheckBackground(this@BatteryInsightService)) {
+                return@launch
+            }
+            if (!UpdateManager.isNetworkAvailable(this@BatteryInsightService)) {
+                return@launch
+            }
+            val res = UpdateManager.checkForUpdate()
+            res.onSuccess { info ->
+                UpdateManager.recordCheckTime(this@BatteryInsightService)
+                if (info.isUpdateAvailable) {
+                    UpdateManager.showUpdateNotification(this@BatteryInsightService, info)
                 }
             }
         }
@@ -440,6 +454,9 @@ class BatteryInsightService : Service() {
                 putInt("sample_count", sampleCount)
                 putInt("min_current", minCurrent)
                 putInt("max_current", maxCurrent)
+                if (lastBatteryLevel in 1..100) {
+                    putInt("last_battery_level", lastBatteryLevel)
+                }
                 apply()
             }
         } catch (_: Exception) {}
@@ -467,6 +484,13 @@ class BatteryInsightService : Service() {
             sampleCount = prefs.getInt("sample_count", 0)
             minCurrent = prefs.getInt("min_current", Int.MAX_VALUE)
             maxCurrent = prefs.getInt("max_current", Int.MIN_VALUE)
+            val savedLevel = prefs.getInt("last_battery_level", -1)
+            if (savedLevel in 1..100) {
+                lastBatteryLevel = savedLevel
+                if (mCurrentStats.level <= 0) {
+                    mCurrentStats.level = savedLevel
+                }
+            }
         } catch (_: Exception) {}
     }
 
@@ -871,6 +895,49 @@ class BatteryInsightService : Service() {
         }
     }
 
+    private fun readSysfsCapacity(): Int {
+        val candidates = listOf(
+            "$batteryBasePath/capacity",
+            "/sys/class/power_supply/battery/capacity",
+            "/sys/class/power_supply/bms/capacity",
+            "/sys/class/power_supply/sec-battery/capacity",
+            "/sys/class/power_supply/qcom-battery/capacity",
+            "/sys/class/power_supply/main/capacity"
+        )
+        for (path in candidates) {
+            val cap = readSysfsInt(path)
+            if (cap in 1..100) return cap
+        }
+        return -1
+    }
+
+    private fun resolveValidBatteryLevel(intentLevel: Int): Int {
+        // 1. Intent EXTRA_LEVEL check (with spurious 0% drop filter)
+        if (intentLevel in 1..100) {
+            if (lastBatteryLevel in 15..100 && intentLevel <= 2 && !isCharging && !isPlugged) {
+                val sysCap = readSysfsCapacity()
+                if (sysCap in 1..100) return sysCap
+                val bmCap = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
+                if (bmCap in 1..100) return bmCap
+            }
+            return intentLevel
+        }
+
+        // 2. BatteryManager property check
+        val bmCap = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
+        if (bmCap in 1..100) return bmCap
+
+        // 3. Direct Sysfs capacity node check
+        val sysCap = readSysfsCapacity()
+        if (sysCap in 1..100) return sysCap
+
+        // 4. Last known valid level check
+        if (lastBatteryLevel in 1..100) return lastBatteryLevel
+        if (mCurrentStats.level in 1..100) return mCurrentStats.level
+
+        return 100
+    }
+
     private fun handleBatteryChanged(intent: Intent) {
         val rawLevel = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
@@ -884,34 +951,33 @@ class BatteryInsightService : Service() {
         isPlugged = plugged != 0
         isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL || isPlugged
 
-        val validLevel = if (level in 1..100) {
-            level
-        } else {
-            val bmCap = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
-            if (bmCap in 1..100) bmCap else if (mCurrentStats.level in 1..100) mCurrentStats.level else 100
-        }
+        val validLevel = resolveValidBatteryLevel(level)
 
-        if (lastBatteryLevel != -1) {
-            if (validLevel < lastBatteryLevel) {
-                val drop = lastBatteryLevel - validLevel
-                if (isScreenOn) {
-                    accumDischargeOn += drop
-                } else {
-                    accumDischargeOff += drop
-                }
-            } else if (validLevel > lastBatteryLevel) {
-                val gain = validLevel - lastBatteryLevel
-                if (isScreenOn) {
-                    accumChargeOn += gain
-                } else {
-                    accumChargeOff += gain
+        if (lastBatteryLevel in 1..100) {
+            val diff = abs(validLevel - lastBatteryLevel)
+            // Filter out impossible instant drops (e.g. >30% drop in one broadcast cycle)
+            if (diff < 30 || isCharging) {
+                if (validLevel < lastBatteryLevel) {
+                    val drop = lastBatteryLevel - validLevel
+                    if (isScreenOn) {
+                        accumDischargeOn += drop
+                    } else {
+                        accumDischargeOff += drop
+                    }
+                } else if (validLevel > lastBatteryLevel) {
+                    val gain = validLevel - lastBatteryLevel
+                    if (isScreenOn) {
+                        accumChargeOn += gain
+                    } else {
+                        accumChargeOff += gain
+                    }
                 }
             }
         }
 
         if (prefs.getBoolean("battery_insight_auto_reset_level_enabled", false)) {
             val target = prefs.getInt("battery_insight_auto_reset_level", 100)
-            if (validLevel >= target && lastBatteryLevel < target) {
+            if (validLevel >= target && lastBatteryLevel in 1..100 && lastBatteryLevel < target) {
                 resetStatsInternal("Auto reset at level $target%")
             }
         }
@@ -944,15 +1010,16 @@ class BatteryInsightService : Service() {
         val nowRealtime = SystemClock.elapsedRealtime()
         val nowUptime = SystemClock.uptimeMillis()
 
-        val deltaRealtime = nowRealtime - lastScreenStateChangeRealtime
-        val deltaUptime = nowUptime - lastScreenStateChangeUptime
+        val deltaRealtime = max(0L, nowRealtime - lastScreenStateChangeRealtime)
+        val deltaUptime = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRealtime)
+        val deltaDeepSleep = max(0L, deltaRealtime - deltaUptime)
 
         if (isScreenOn) {
             accumScreenOnMs += deltaRealtime
         } else {
             accumScreenOffMs += deltaRealtime
             accumAwakeMs += deltaUptime
-            accumDeepSleepMs += max(0L, deltaRealtime - deltaUptime)
+            accumDeepSleepMs += deltaDeepSleep
         }
 
         if (isCharging || isPlugged) {
@@ -971,20 +1038,21 @@ class BatteryInsightService : Service() {
 
     private fun fillStatsLocked() {
         if (mCurrentStats.level <= 0) {
-            val bmCap = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { 100 }
-            mCurrentStats.level = if (bmCap in 1..100) bmCap else 100
+            mCurrentStats.level = resolveValidBatteryLevel(-1)
         }
 
         val nowRealtime = SystemClock.elapsedRealtime()
         val nowUptime = SystemClock.uptimeMillis()
 
-        val curDeltaRt = nowRealtime - lastScreenStateChangeRealtime
-        val curDeltaUp = nowUptime - lastScreenStateChangeUptime
+        val curDeltaRt = max(0L, nowRealtime - lastScreenStateChangeRealtime)
+        val rawDeltaUp = max(0L, nowUptime - lastScreenStateChangeUptime)
+        val curDeltaUp = rawDeltaUp.coerceIn(0L, curDeltaRt)
+        val curDeltaDs = max(0L, curDeltaRt - curDeltaUp)
 
         val curScreenOn = accumScreenOnMs + if (isScreenOn) curDeltaRt else 0L
         val curScreenOff = accumScreenOffMs + if (!isScreenOn) curDeltaRt else 0L
         val curAwake = accumAwakeMs + if (!isScreenOn) curDeltaUp else 0L
-        val curDeepSleep = accumDeepSleepMs + if (!isScreenOn) max(0L, curDeltaRt - curDeltaUp) else 0L
+        val curDeepSleep = accumDeepSleepMs + if (!isScreenOn) curDeltaDs else 0L
 
         val curChargeScreenOn = if (isCharging || isPlugged) {
             accumChargeScreenOnMs + if (isScreenOn) curDeltaRt else 0L
@@ -1151,19 +1219,23 @@ class BatteryInsightService : Service() {
                         updateNotification()
                     }
 
-                    if (loopCount % 30 == 0) {
+                    if (now - lastSessionSaveTime >= 30000L) {
+                        lastSessionSaveTime = now
                         saveSessionState()
                         saveSessionArchives()
                     }
 
                     // Periodic re-assertion of root immortality and watchdog keep-alive
-                    if (loopCount % 15 == 0) {
+                    if (now - lastOomScoreTime >= 15000L) {
+                        lastOomScoreTime = now
                         ShellUtils.exec("echo -1000 > /proc/${android.os.Process.myPid()}/oom_score_adj 2>/dev/null")
                     }
 
-                    if (loopCount % 300 == 0) {
+                    if (now - lastWatchdogTime >= 300000L) {
+                        lastWatchdogTime = now
                         scheduleWatchdog()
                         applyRootImmortality()
+                        checkBackgroundUpdates(0L)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in monitor loop", e)
@@ -1498,13 +1570,13 @@ class BatteryInsightService : Service() {
         val now = System.currentTimeMillis()
 
         // 1. Sıfır Akım Tam Şarj Bildirimi (Zero Current Full Charge Alarm)
-        // Telefon %100 veya BATTERY_STATUS_FULL olduktan sonra sürekli (en az 5 ölçüm) sıfır akıma (<= 5 mA) inmedikçe bildirim atma!
-        if (mCurrentStats.isZeroCurrentAlarmEnabled && (charging || isPlugged)) {
-            val isFullOrHundred = level >= 100 || mCurrentStats.status == BatteryManager.BATTERY_STATUS_FULL
+        // Telefon KESİNLİKLE %100 olduktan sonra VE sürekli (en az 10 saniye/ölçüm) sıfır akıma (<= 5 mA) inmedikçe bildirim atma!
+        // level < 100 iken cihaz/OEM BATTERY_STATUS_FULL raporlasa bile (termal duraklama, pil koruma limiti vb.) ASLA tam şarj bildirimi atılmaz!
+        if (mCurrentStats.isZeroCurrentAlarmEnabled && (charging || isPlugged) && level >= 100) {
             val currentNowAbs = abs(mCurrentStats.currentNow)
-            if (isFullOrHundred && currentNowAbs <= 5) {
+            if (currentNowAbs <= 5) {
                 zeroCurrentSustainCount++
-                if (zeroCurrentSustainCount >= 5) {
+                if (zeroCurrentSustainCount >= 10) {
                     if (now - lastZeroCurrentNotifiedTime >= 120000) {
                         triggerAlarm(
                             getString(R.string.battery_insight_alarm_zero_current_title, level),
@@ -1592,6 +1664,7 @@ class BatteryInsightService : Service() {
             chargeCurrentSum = 0L
             chargeSampleCount = 0
             zeroCurrentSustainCount = 0
+            lastZeroCurrentNotifiedTime = 0L
 
             minCurrent = Int.MAX_VALUE
             maxCurrent = Int.MIN_VALUE
@@ -1625,77 +1698,92 @@ class BatteryInsightService : Service() {
 
     /**
      * Notification-specific duration format:
-     * - If < 60 minutes (< 1 hour): "X dk" (hours appear ONLY when >= 60 min)
-     * - If >= 60 minutes (>= 1 hour): "X sa Y dk"
+     * - If 0: "0 dk" / "0m"
+     * - If in 1..59999L: "< 1 dk" / "< 1m"
+     * - If < 60 minutes: "X dk"
+     * - If >= 60 minutes: "X sa Y dk"
      * - NO seconds are ever displayed in the notification.
      */
     private fun formatDurationNotif(ms: Long): String {
+        if (ms <= 0L) {
+            return getString(R.string.battery_insight_duration_m, 0)
+        }
         val totalSec = ms / 1000
         val totalMin = totalSec / 60
         val h = totalMin / 60
         val m = totalMin % 60
-        return if (h > 0) {
-            getString(R.string.battery_insight_duration_h_m, h, m)
-        } else {
-            getString(R.string.battery_insight_duration_m, m)
+        return when {
+            h > 0 -> getString(R.string.battery_insight_duration_h_m, h, m)
+            m > 0 -> getString(R.string.battery_insight_duration_m, m)
+            else -> getString(R.string.battery_insight_duration_less_than_minute)
         }
     }
 
-    private fun createNotification(): Notification {
-        val s = synchronized(mCurrentStats) { mCurrentStats.copy() }
-        val isChargingState = s.isCharging || isPlugged
-        val mA = abs(s.currentNow)
-        val currentStr = if (isChargingState) {
-            if (mA > 0) "+$mA mA" else "0 mA"
+    private fun createNotification(
+        titleOverride: String? = null,
+        summaryOverride: String? = null,
+        bodyOverride: String? = null
+    ): Notification {
+        val title: String
+        val summary: String
+        val body: String
+
+        if (titleOverride != null && summaryOverride != null && bodyOverride != null) {
+            title = titleOverride
+            summary = summaryOverride
+            body = bodyOverride
         } else {
-            if (mA > 0) "-$mA mA" else "0 mA"
-        }
-        val statusStr = if (isChargingState) {
-            if (s.level >= 100) getString(R.string.battery_insight_notif_full) else getString(R.string.battery_insight_notif_charging)
-        } else {
-            getString(R.string.battery_insight_notif_discharging)
-        }
+            val s = synchronized(mCurrentStats) { mCurrentStats.copy() }
+            val isChargingState = s.isCharging || isPlugged
+            val mA = abs(s.currentNow)
+            val currentStr = if (isChargingState) {
+                if (mA > 0) "+$mA mA" else "0 mA"
+            } else {
+                if (mA > 0) "-$mA mA" else "0 mA"
+            }
+            val statusStr = if (isChargingState) {
+                if (s.level >= 100) getString(R.string.battery_insight_notif_full) else getString(R.string.battery_insight_notif_charging)
+            } else {
+                getString(R.string.battery_insight_notif_discharging)
+            }
 
-        val tempStr = "%.1f".format(s.temp / 10f)
-        val powerWattsStr = "%.2f".format(s.powerWatts)
+            val tempStr = "%.1f".format(s.temp / 10f)
+            val powerWattsStr = "%.2f".format(s.powerWatts)
 
-        val title = "${s.level}% • $statusStr • $currentStr • ${tempStr}°C"
-        val summary = "${s.level}% • $currentStr • $powerWattsStr W"
+            title = "${s.level}% • $statusStr • $currentStr • ${tempStr}°C"
+            summary = "${s.level}% • $currentStr • $powerWattsStr W"
 
-        val totalScreenOff = s.screenOffTime
-        val awakePct = if (totalScreenOff >= 10000L) {
-            ((s.awakeTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
-        } else {
-            0f
-        }
-        val deepSleepPct = if (totalScreenOff >= 10000L) {
-            ((s.deepSleepTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
-        } else {
-            0f
-        }
+            val totalScreenOff = s.screenOffTime
+            val hasSignificantScreenOff = totalScreenOff >= 60000L
 
-        val activeRateStr = if (s.screenOnTime >= 60000L && s.activeDrainRate > 0f) "%.1f".format(s.activeDrainRate) else "0.0"
-        val idleRateStr = if (s.screenOffTime >= 60000L && s.idleDrainRate > 0f) "%.1f".format(s.idleDrainRate) else "0.0"
-        val awakePctStr = "%.1f".format(awakePct)
-        val deepSleepPctStr = "%.1f".format(deepSleepPct)
+            val awakePct = if (hasSignificantScreenOff && s.awakeTime > 0L) {
+                ((s.awakeTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
+            } else {
+                0f
+            }
+            val deepSleepPct = if (hasSignificantScreenOff && s.deepSleepTime > 0L) {
+                ((s.deepSleepTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
+            } else {
+                0f
+            }
 
-        val body = buildString {
-            append(getString(R.string.battery_insight_notif_active, activeRateStr))
-            append(" • ")
-            append(getString(R.string.battery_insight_notif_idle, idleRateStr))
-            append("\n")
-            append(getString(R.string.battery_insight_notif_screen_on, formatDurationNotif(s.screenOnTime), s.batteryDrainScreenOn.toString()))
-            append("\n")
-            append(getString(R.string.battery_insight_notif_screen_off, formatDurationNotif(s.screenOffTime), s.batteryDrainScreenOff.toString()))
-            append("\n")
-            if (totalScreenOff >= 10000L) {
+            val activeRateStr = if (s.screenOnTime >= 60000L && s.activeDrainRate > 0f) "%.1f".format(s.activeDrainRate) else "0.0"
+            val idleRateStr = if (s.screenOffTime >= 60000L && s.idleDrainRate > 0f) "%.1f".format(s.idleDrainRate) else "0.0"
+            val awakePctStr = "%.1f".format(awakePct)
+            val deepSleepPctStr = "%.1f".format(deepSleepPct)
+
+            body = buildString {
+                append(getString(R.string.battery_insight_notif_active, activeRateStr))
+                append(" • ")
+                append(getString(R.string.battery_insight_notif_idle, idleRateStr))
+                append("\n")
+                append(getString(R.string.battery_insight_notif_screen_on, formatDurationNotif(s.screenOnTime), s.batteryDrainScreenOn.toString()))
+                append("\n")
+                append(getString(R.string.battery_insight_notif_screen_off, formatDurationNotif(s.screenOffTime), s.batteryDrainScreenOff.toString()))
+                append("\n")
                 append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), awakePctStr))
                 append("\n")
                 append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), deepSleepPctStr))
-            } else {
-                append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), "0.0"))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), "0.0"))
             }
         }
 
@@ -1744,10 +1832,12 @@ class BatteryInsightService : Service() {
             val activeRateStr = if (s.screenOnTime >= 60000L && s.activeDrainRate > 0f) "%.1f".format(s.activeDrainRate) else "0.0"
             val idleRateStr = if (s.screenOffTime >= 60000L && s.idleDrainRate > 0f) "%.1f".format(s.idleDrainRate) else "0.0"
             val totalScreenOff = s.screenOffTime
-            val awakePct = if (totalScreenOff >= 10000L) {
+            val hasSignificantScreenOff = totalScreenOff >= 60000L
+
+            val awakePct = if (hasSignificantScreenOff && s.awakeTime > 0L) {
                 ((s.awakeTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
             } else 0f
-            val deepSleepPct = if (totalScreenOff >= 10000L) {
+            val deepSleepPct = if (hasSignificantScreenOff && s.deepSleepTime > 0L) {
                 ((s.deepSleepTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
             } else 0f
             val awakePctStr = "%.1f".format(awakePct)
@@ -1762,15 +1852,9 @@ class BatteryInsightService : Service() {
                 append("\n")
                 append(getString(R.string.battery_insight_notif_screen_off, formatDurationNotif(s.screenOffTime), s.batteryDrainScreenOff.toString()))
                 append("\n")
-                if (totalScreenOff >= 10000L) {
-                    append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), awakePctStr))
-                    append("\n")
-                    append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), deepSleepPctStr))
-                } else {
-                    append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), "0.0"))
-                    append("\n")
-                    append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), "0.0"))
-                }
+                append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), awakePctStr))
+                append("\n")
+                append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), deepSleepPctStr))
             }
 
             // Real-time updates: update immediately when any value changes (mA, watts, level, temp, etc.)
@@ -1782,7 +1866,7 @@ class BatteryInsightService : Service() {
             lastNotifTitle = newTitle
             lastNotifSummary = newSummary
             lastNotifBody = newBody
-            notifManager.notify(NOTIF_ID, createNotification())
+            notifManager.notify(NOTIF_ID, createNotification(newTitle, newSummary, newBody))
         } catch (e: Exception) {
             Log.e(TAG, "Error updating notification", e)
         }

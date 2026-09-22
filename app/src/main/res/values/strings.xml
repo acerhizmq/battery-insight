@@ -174,6 +174,7 @@
     <string name="battery_insight_health_details_title">Battery health details</string>
     <string name="battery_insight_duration_h_m">%1$dh %2$dm</string>
     <string name="battery_insight_duration_m">%1$dm</string>
+    <string name="battery_insight_duration_less_than_minute">&lt; 1m</string>
     <string name="battery_insight_duration_m_s">%1$dm %2$ds</string>
     <string name="battery_insight_duration_s">%1$ds</string>
     <string name="battery_insight_perm_gate_title">Permissions Required</string>
