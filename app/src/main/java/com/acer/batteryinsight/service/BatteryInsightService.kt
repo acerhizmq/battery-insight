@@ -17,6 +17,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.BatteryManager
@@ -28,27 +31,32 @@ import android.os.Vibrator
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
+import com.acer.batteryinsight.R
 import com.acer.batteryinsight.model.BatteryInsightAppUsage
 import com.acer.batteryinsight.model.BatteryInsightFlowSample
 import com.acer.batteryinsight.model.BatteryInsightHistoryBucket
 import com.acer.batteryinsight.model.BatteryInsightStats
-import com.acer.batteryinsight.service.IBatteryInsightService
 import com.acer.batteryinsight.updater.UpdateManager
-import com.acer.batteryinsight.MainActivity
-import com.acer.batteryinsight.R
+import com.acer.batteryinsight.utils.IconUtils
 import com.acer.batteryinsight.utils.ShellUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.Locale
-import java.util.Calendar
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -57,13 +65,26 @@ class BatteryInsightService : Service() {
     companion object {
         private const val TAG = "BatteryInsightService"
         private const val NOTIF_CHANNEL_ID = "battery_insight_monitor_v4"
-        private const val ALARM_CHANNEL_ID = "battery_insight_alarm_channel"
+        // v2: the channel is silent because the user-selected sound/vibration is played manually.
+        private const val ALARM_CHANNEL_ID = "battery_insight_alarm_channel_v2"
         private const val NOTIF_ID = 1001
         private const val ALARM_NOTIF_ID = 1002
 
         private const val FLOW_SAMPLE_INTERVAL_MS = 2000L
         private const val MAX_FLOW_SAMPLES = 1440
         private const val MAX_HISTORY_BUCKETS = 72
+        private const val DEFAULT_MONITOR_INTERVAL_MS = 10000
+
+        private const val SESSION_SAVE_INTERVAL_MS = 30_000L
+        private const val OOM_REASSERT_INTERVAL_MS = 60_000L
+        private const val WATCHDOG_INTERVAL_MS = 5 * 60 * 1000L
+        private const val IMMORTALITY_INTERVAL_MS = 30 * 60 * 1000L
+        private const val APP_USAGE_REFRESH_MS = 2 * 60 * 1000L
+        private const val ZERO_CURRENT_MAX_MA = 5
+        private const val ZERO_CURRENT_SUSTAIN_MS = 20_000L
+
+        const val WATCHDOG_ACTION = "com.acer.batteryinsight.WATCHDOG_KEEPALIVE"
+        const val PREF_NOTIF_ICON_STYLE = "battery_insight_notif_icon_style"
 
         @Volatile
         var instance: IBatteryInsightService? = null
@@ -71,10 +92,19 @@ class BatteryInsightService : Service() {
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // All mutable session state is touched from this single thread (broadcasts + monitor loop),
+    // and additionally guarded by mCurrentStats for binder callers.
+    private val stateExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "BatteryInsightState") }
+    private val stateDispatcher = stateExecutor.asCoroutineDispatcher()
+    private var monitorJob: Job? = null
+
     private lateinit var prefs: SharedPreferences
     private lateinit var notifManager: NotificationManager
     private lateinit var batteryManager: BatteryManager
+    private lateinit var storage: SessionStorage
     private var vibrator: Vibrator? = null
+    private var activeRingtone: Ringtone? = null
 
     private val mCurrentStats = BatteryInsightStats()
     private val mFlowSamples = CopyOnWriteArrayList<BatteryInsightFlowSample>()
@@ -86,23 +116,24 @@ class BatteryInsightService : Service() {
     private val mLastDischargeFlowSamples = CopyOnWriteArrayList<BatteryInsightFlowSample>()
     private val mLastDischargeHistoryBuckets = CopyOnWriteArrayList<BatteryInsightHistoryBucket>()
 
-    private var batteryBasePath: String = "/sys/class/power_supply/battery"
-    private var verifiedCurrentNowPath: String? = null
-    private var cycleCountPath: String? = null
-    private var cachedDesignCapacity: Int = 0
-    private var cachedChargeFull: Int = 0
-    private var cachedCycleCount: Int = 0
+    @Volatile private var batteryBasePath: String = "/sys/class/power_supply/battery"
+    @Volatile private var verifiedCurrentNowPath: String? = null
+    @Volatile private var cycleCountPath: String? = null
+    @Volatile private var cachedDesignCapacity: Int = 0
+    @Volatile private var cachedChargeFull: Int = 0
+    @Volatile private var cachedCycleCount: Int = 0
     private var lastStaticStatsCheckRealtime: Long = 0L
     private val cachedAppMap = mutableMapOf<Int, Pair<String, String>>()
 
     private var isScreenOn = true
     private var isCharging = false
     private var isPlugged = false
+    private var batteryStatus = -1
 
     private var lastBatteryLevel = -1
+    private var levelValidator = BatteryLevelValidator()
+    private var currentNormalizer = CurrentNormalizer()
     private var lastFlowSampleTime = 0L
-    private var lastAlarmNotifiedLevel = -1
-    private var lastAlarmNotifiedTime = 0L
 
     // Session Metrics State
     private var sessionStartRealtime = SystemClock.elapsedRealtime()
@@ -124,9 +155,16 @@ class BatteryInsightService : Service() {
     private var chargeCurrentSum = 0L
     private var chargeSampleCount = 0
 
-    private var zeroCurrentSustainCount = 0
+    /** Wall time of the last plug / unplug transition; bounds the archived "last" sessions. */
+    private var segmentStartWallMs = 0L
+
+    // Current hourly bucket baselines and per-hour current statistics
     private var bucketStartDrain = 0
     private var bucketStartScreenOnMs = 0L
+    private var bucketMinCurrent = Int.MAX_VALUE
+    private var bucketMaxCurrent = Int.MIN_VALUE
+    private var bucketCurrentSum = 0L
+    private var bucketSampleCount = 0
 
     private var lastScreenStateChangeRealtime = SystemClock.elapsedRealtime()
     private var lastScreenStateChangeUptime = SystemClock.uptimeMillis()
@@ -134,30 +172,38 @@ class BatteryInsightService : Service() {
     private var lastSessionSaveTime = 0L
     private var lastOomScoreTime = 0L
     private var lastWatchdogTime = 0L
+    private var lastImmortalityTime = 0L
 
-    // Current tracking
+    // Session-wide current statistics
     private var minCurrent = Int.MAX_VALUE
     private var maxCurrent = Int.MIN_VALUE
     private var totalCurrentSum = 0L
     private var sampleCount = 0
 
+    // Alarms
+    private val lowAlarm = AlarmTracker()
+    private val highAlarm = AlarmTracker()
+    private val fullAlarm = AlarmTracker()
+    private val zeroCurrentAlarm = AlarmTracker()
+    private var zeroCurrentSinceMs = 0L
+
+    // App usage refresh
+    private val appUsageFetchInFlight = AtomicBoolean(false)
+    @Volatile private var lastAppUsageFetchMs = 0L
+
     // Notification caching – prevent redundant IPC calls when values haven't changed
     private var lastNotifTitle = ""
     private var lastNotifSummary = ""
     private var lastNotifBody = ""
+    private var lastNotifIconKey = ""
+    private val statusIconRenderer = StatusIconRenderer()
 
-    private val contentPendingIntent by lazy {
-        PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-    }
+    private var cachedContentIntentComponent: String? = null
+    private var cachedContentIntent: PendingIntent? = null
 
     private val binder = object : IBatteryInsightService.Stub() {
         override fun getBatteryState(): BatteryInsightStats = synchronized(mCurrentStats) {
-            fillStatsLocked()
+            fillStatsLocked(recordSample = false)
             mCurrentStats.copy()
         }
 
@@ -166,7 +212,7 @@ class BatteryInsightService : Service() {
             return mFlowSamples.takeLast(count).toTypedArray()
         }
 
-        override fun getHistory(): Array<BatteryInsightHistoryBucket> = mHistoryBuckets.toTypedArray()
+        override fun getHistory(): Array<BatteryInsightHistoryBucket> = copyBuckets(mHistoryBuckets)
 
         override fun getSessionFlow(sessionType: Int): Array<BatteryInsightFlowSample> {
             return when (sessionType) {
@@ -178,16 +224,14 @@ class BatteryInsightService : Service() {
 
         override fun getSessionHistory(sessionType: Int): Array<BatteryInsightHistoryBucket> {
             return when (sessionType) {
-                1 -> mLastChargeHistoryBuckets.toTypedArray()
-                2 -> mLastDischargeHistoryBuckets.toTypedArray()
-                else -> mHistoryBuckets.toTypedArray()
+                1 -> copyBuckets(mLastChargeHistoryBuckets)
+                2 -> copyBuckets(mLastDischargeHistoryBuckets)
+                else -> copyBuckets(mHistoryBuckets)
             }
         }
 
         override fun getAppUsageSinceLastCharge(maxEntries: Int): Array<BatteryInsightAppUsage> {
-            if (mAppUsages.isEmpty()) {
-                scope.launch { fetchAppUsages() }
-            }
+            maybeRefreshAppUsages()
             return mAppUsages.take(maxEntries).toTypedArray()
         }
 
@@ -198,15 +242,19 @@ class BatteryInsightService : Service() {
         override fun isEnabled(): Boolean = prefs.getBoolean("battery_insight_enabled", true)
         override fun setEnabled(enabled: Boolean) {
             prefs.edit().putBoolean("battery_insight_enabled", enabled).apply()
-            synchronized(mCurrentStats) { mCurrentStats.isNotificationEnabled = enabled }
-            if (enabled) updateNotification() else notifManager.cancel(NOTIF_ID)
+            if (enabled) forceNotificationUpdate() else notifManager.cancel(NOTIF_ID)
         }
 
         override fun isNotificationEnabled(): Boolean = prefs.getBoolean("battery_insight_notif_enabled", true)
         override fun setNotificationEnabled(enabled: Boolean) {
             prefs.edit().putBoolean("battery_insight_notif_enabled", enabled).apply()
             synchronized(mCurrentStats) { mCurrentStats.isNotificationEnabled = enabled }
-            if (enabled) updateNotification() else notifManager.cancel(NOTIF_ID)
+            if (enabled) forceNotificationUpdate() else notifManager.cancel(NOTIF_ID)
+        }
+
+        override fun setNotificationIconStyle(style: Int) {
+            prefs.edit().putInt(PREF_NOTIF_ICON_STYLE, style.coerceIn(0, StatusIconRenderer.STYLE_COUNT - 1)).apply()
+            forceNotificationUpdate()
         }
 
         override fun setAutoResetLevel(level: Int) {
@@ -229,7 +277,7 @@ class BatteryInsightService : Service() {
             synchronized(mCurrentStats) { mCurrentStats.isResetOnReboot = enabled }
         }
 
-        override fun getMonitorInterval(): Int = prefs.getInt("battery_insight_monitor_interval", 10000)
+        override fun getMonitorInterval(): Int = prefs.getInt("battery_insight_monitor_interval", DEFAULT_MONITOR_INTERVAL_MS)
         override fun setMonitorInterval(intervalMs: Int) {
             prefs.edit().putInt("battery_insight_monitor_interval", intervalMs).apply()
             synchronized(mCurrentStats) { mCurrentStats.monitorInterval = intervalMs }
@@ -252,7 +300,12 @@ class BatteryInsightService : Service() {
 
         override fun setAlarmFrequency(frequency: Int) {
             prefs.edit().putInt("battery_insight_alarm_frequency", frequency).apply()
-            synchronized(mCurrentStats) { mCurrentStats.alarmFrequency = frequency }
+            synchronized(mCurrentStats) {
+                mCurrentStats.alarmFrequency = frequency
+                // Start counting from the current level under the new rule.
+                lowAlarm.reset()
+                highAlarm.reset()
+            }
         }
 
         override fun setFullChargeAlarmEnabled(enabled: Boolean) {
@@ -278,71 +331,47 @@ class BatteryInsightService : Service() {
 
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            try {
-                when (intent.action) {
-                    Intent.ACTION_BATTERY_CHANGED -> handleBatteryChanged(intent)
-                    Intent.ACTION_POWER_CONNECTED -> {
-                        val nowRealtime = SystemClock.elapsedRealtime()
-                        val nowUptime = SystemClock.uptimeMillis()
-                        val deltaRt = max(0L, nowRealtime - lastScreenStateChangeRealtime)
-                        val deltaUp = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRt)
-                        val deltaDs = max(0L, deltaRt - deltaUp)
-                        if (isScreenOn) {
-                            accumScreenOnMs += deltaRt
-                        } else {
-                            accumScreenOffMs += deltaRt
-                            accumAwakeMs += deltaUp
-                            accumDeepSleepMs += deltaDs
-                        }
-                        lastScreenStateChangeRealtime = nowRealtime
-                        lastScreenStateChangeUptime = nowUptime
-
-                        isPlugged = true
-                        archiveSession(isChargingSession = false)
-                        if (prefs.getBoolean("battery_insight_reset_on_plugged", false)) {
-                            resetStatsInternal("Reset on power connected")
-                        }
-                        saveSessionState()
-                    }
-                    Intent.ACTION_POWER_DISCONNECTED -> {
-                        val nowRealtime = SystemClock.elapsedRealtime()
-                        val nowUptime = SystemClock.uptimeMillis()
-                        val deltaRt = max(0L, nowRealtime - lastScreenStateChangeRealtime)
-                        val deltaUp = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRt)
-                        val deltaDs = max(0L, deltaRt - deltaUp)
-                        if (isScreenOn) {
-                            accumScreenOnMs += deltaRt
-                            accumChargeScreenOnMs += deltaRt
-                        } else {
-                            accumScreenOffMs += deltaRt
-                            accumAwakeMs += deltaUp
-                            accumDeepSleepMs += deltaDs
-                            accumChargeScreenOffMs += deltaRt
-                        }
-                        lastScreenStateChangeRealtime = nowRealtime
-                        lastScreenStateChangeUptime = nowUptime
-
-                        isPlugged = false
-                        zeroCurrentSustainCount = 0
-                        lastZeroCurrentNotifiedTime = 0L
-                        synchronized(mCurrentStats) {
-                            mCurrentStats.chargeScreenOnTime = accumChargeScreenOnMs
-                            mCurrentStats.chargeScreenOffTime = accumChargeScreenOffMs
-                            val totalChargeGain = accumChargeOn + accumChargeOff
-                            val chargeHoursTotal = (accumChargeScreenOnMs + accumChargeScreenOffMs) / 3600000f
-                            if (chargeHoursTotal >= 0.016f && totalChargeGain > 0) {
-                                mCurrentStats.chargeRate = totalChargeGain / chargeHoursTotal
-                            }
-                        }
-                        archiveSession(isChargingSession = true)
-                        saveSessionState()
-                    }
-                    Intent.ACTION_SCREEN_ON -> handleScreenStateChange(true)
-                    Intent.ACTION_SCREEN_OFF -> handleScreenStateChange(false)
+            // Handled off the main thread, in order, on the state thread.
+            scope.launch(stateDispatcher) {
+                try {
+                    handleBroadcast(intent)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in batteryReceiver", e)
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in batteryReceiver", e)
             }
+        }
+    }
+
+    private fun handleBroadcast(intent: Intent) {
+        when (intent.action) {
+            Intent.ACTION_BATTERY_CHANGED -> synchronized(mCurrentStats) { handleBatteryChangedLocked(intent) }
+            Intent.ACTION_POWER_CONNECTED -> synchronized(mCurrentStats) {
+                accumulateScreenTimeLocked(countAsCharging = false)
+                isPlugged = true
+                archiveSessionLocked(isChargingSession = false)
+                segmentStartWallMs = System.currentTimeMillis()
+                if (prefs.getBoolean("battery_insight_reset_on_plugged", false)) {
+                    resetStatsInternal("Reset on power connected")
+                }
+                saveSessionState()
+            }
+            Intent.ACTION_POWER_DISCONNECTED -> synchronized(mCurrentStats) {
+                accumulateScreenTimeLocked(countAsCharging = true)
+                isPlugged = false
+                zeroCurrentSinceMs = 0L
+                mCurrentStats.chargeScreenOnTime = accumChargeScreenOnMs
+                mCurrentStats.chargeScreenOffTime = accumChargeScreenOffMs
+                val totalChargeGain = accumChargeOn + accumChargeOff
+                val chargeHoursTotal = (accumChargeScreenOnMs + accumChargeScreenOffMs) / 3600000f
+                if (chargeHoursTotal >= 0.016f && totalChargeGain > 0) {
+                    mCurrentStats.chargeRate = totalChargeGain / chargeHoursTotal
+                }
+                archiveSessionLocked(isChargingSession = true)
+                segmentStartWallMs = System.currentTimeMillis()
+                saveSessionState()
+            }
+            Intent.ACTION_SCREEN_ON -> synchronized(mCurrentStats) { handleScreenStateChangeLocked(true) }
+            Intent.ACTION_SCREEN_OFF -> synchronized(mCurrentStats) { handleScreenStateChangeLocked(false) }
         }
     }
 
@@ -352,6 +381,7 @@ class BatteryInsightService : Service() {
             prefs = getSharedPreferences("battery_insight_prefs", Context.MODE_PRIVATE)
             notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             batteryManager = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            storage = SessionStorage(filesDir)
             vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? android.os.VibratorManager
                 vm?.defaultVibrator
@@ -361,23 +391,33 @@ class BatteryInsightService : Service() {
             }
 
             createNotificationChannels()
-            loadSettingsIntoStats()
-            restoreSessionState()
-            restoreSessionArchives()
+            synchronized(mCurrentStats) {
+                loadSettingsIntoStats()
+                restoreSessionState()
+                restoreSessionArchives()
+                restoreBucketState()
 
-            val stickyBattery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            val rawLevel = stickyBattery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-            val rawScale = stickyBattery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-            val accuratePct = if (rawLevel >= 0 && rawScale > 0) ((rawLevel * 100) / rawScale) else -1
+                val stickyBattery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val rawLevel = stickyBattery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                val rawScale = stickyBattery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+                val stickyPct = if (rawLevel >= 0 && rawScale > 0) ((rawLevel * 100) / rawScale) else -1
+                val plugged = stickyBattery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
+                isPlugged = plugged != 0
+                batteryStatus = stickyBattery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                isCharging = batteryStatus == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    batteryStatus == BatteryManager.BATTERY_STATUS_FULL || isPlugged
 
-            val initialValidLevel = resolveValidBatteryLevel(accuratePct)
-            mCurrentStats.level = initialValidLevel
-            lastBatteryLevel = initialValidLevel
+                val initialLevel = acceptLevelLocked(stickyPct)
+                if (BatteryLevelValidator.isValid(initialLevel)) {
+                    mCurrentStats.level = initialLevel
+                    lastBatteryLevel = initialLevel
+                }
 
-            val powerManager = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-            isScreenOn = powerManager?.isInteractive ?: true
-            lastScreenStateChangeRealtime = SystemClock.elapsedRealtime()
-            lastScreenStateChangeUptime = SystemClock.uptimeMillis()
+                val powerManager = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                isScreenOn = powerManager?.isInteractive ?: true
+                lastScreenStateChangeRealtime = SystemClock.elapsedRealtime()
+                lastScreenStateChangeUptime = SystemClock.uptimeMillis()
+            }
 
             val filter = IntentFilter().apply {
                 addAction(Intent.ACTION_BATTERY_CHANGED)
@@ -389,19 +429,23 @@ class BatteryInsightService : Service() {
             ContextCompat.registerReceiver(this, batteryReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
 
             instance = binder
-            startForegroundSafely()
+            if (!startForegroundSafely()) {
+                scheduleWatchdog()
+                stopSelf()
+                return
+            }
             scheduleWatchdog()
 
             // Asynchronously detect hardware paths and initialize root in background without freezing main UI thread
             scope.launch(Dispatchers.IO) {
                 detectHardwarePaths()
-                synchronized(mCurrentStats) { fillStatsLocked() }
+                synchronized(mCurrentStats) { fillStatsLocked(recordSample = false) }
                 ShellUtils.initRootShell { isRoot ->
                     if (isRoot) {
                         scope.launch(Dispatchers.IO) {
                             detectHardwarePaths()
                             applyRootImmortality()
-                            synchronized(mCurrentStats) { fillStatsLocked() }
+                            synchronized(mCurrentStats) { fillStatsLocked(recordSample = false) }
                         }
                     }
                 }
@@ -412,6 +456,9 @@ class BatteryInsightService : Service() {
             Log.e(TAG, "Fatal error during onCreate of BatteryInsightService", e)
         }
     }
+
+    private fun copyBuckets(source: List<BatteryInsightHistoryBucket>): Array<BatteryInsightHistoryBucket> =
+        synchronized(mCurrentStats) { source.map { it.copy() }.toTypedArray() }
 
     private fun checkBackgroundUpdates(delayMs: Long = 15000L) {
         scope.launch(Dispatchers.IO) {
@@ -431,6 +478,8 @@ class BatteryInsightService : Service() {
             }
         }
     }
+
+    // region Persistence
 
     private fun saveSessionState() {
         try {
@@ -454,16 +503,58 @@ class BatteryInsightService : Service() {
                 putInt("sample_count", sampleCount)
                 putInt("min_current", minCurrent)
                 putInt("max_current", maxCurrent)
-                if (lastBatteryLevel in 1..100) {
+                putLong("segment_start_wall", segmentStartWallMs)
+                if (BatteryLevelValidator.isValid(lastBatteryLevel)) {
                     putInt("last_battery_level", lastBatteryLevel)
+                    putLong("last_battery_level_time", levelValidator.lastAcceptedAtMs)
+                }
+                mHistoryBuckets.lastOrNull()?.let { b ->
+                    putInt("bucket_start_day", b.epochDay)
+                    putInt("bucket_start_hour", b.hour)
+                    putInt("bucket_start_drain", bucketStartDrain)
+                    putLong("bucket_start_sot", bucketStartScreenOnMs)
+                }
+                if (currentNormalizer.dirty) {
+                    putInt("current_unit_sysfs", unitToPref(currentNormalizer.sysfsMicroAmps))
+                    putInt("current_unit_bm", unitToPref(currentNormalizer.batteryManagerMicroAmps))
+                    putInt("current_discharge_sign", currentNormalizer.dischargeSign)
+                    putInt("current_charge_sign", currentNormalizer.chargeSign)
+                    currentNormalizer.markSaved()
                 }
                 apply()
             }
         } catch (_: Exception) {}
     }
 
+    private fun unitToPref(micro: Boolean?): Int = when (micro) {
+        true -> 1
+        false -> 2
+        null -> 0
+    }
+
+    private fun prefToUnit(value: Int): Boolean? = when (value) {
+        1 -> true
+        2 -> false
+        else -> null
+    }
+
     private fun restoreSessionState() {
         try {
+            currentNormalizer = CurrentNormalizer(
+                sysfsMicroAmps = prefToUnit(prefs.getInt("current_unit_sysfs", 0)),
+                batteryManagerMicroAmps = prefToUnit(prefs.getInt("current_unit_bm", 0)),
+                dischargeSign = prefs.getInt("current_discharge_sign", 0),
+                chargeSign = prefs.getInt("current_charge_sign", 0),
+            )
+            val savedLevel = prefs.getInt("last_battery_level", -1)
+            if (BatteryLevelValidator.isValid(savedLevel)) {
+                lastBatteryLevel = savedLevel
+                levelValidator = BatteryLevelValidator(savedLevel, prefs.getLong("last_battery_level_time", 0L))
+                if (mCurrentStats.level <= 0) {
+                    mCurrentStats.level = savedLevel
+                }
+            }
+
             if (!prefs.contains("session_start_walltime")) return
             sessionStartRealtime = prefs.getLong("session_start_realtime", sessionStartRealtime)
             sessionStartUptime = prefs.getLong("session_start_uptime", sessionStartUptime)
@@ -484,198 +575,142 @@ class BatteryInsightService : Service() {
             sampleCount = prefs.getInt("sample_count", 0)
             minCurrent = prefs.getInt("min_current", Int.MAX_VALUE)
             maxCurrent = prefs.getInt("max_current", Int.MIN_VALUE)
-            val savedLevel = prefs.getInt("last_battery_level", -1)
-            if (savedLevel in 1..100) {
-                lastBatteryLevel = savedLevel
-                if (mCurrentStats.level <= 0) {
-                    mCurrentStats.level = savedLevel
-                }
-            }
+            segmentStartWallMs = prefs.getLong("segment_start_wall", 0L)
         } catch (_: Exception) {}
     }
 
-    private fun archiveSession(isChargingSession: Boolean) {
+    /** Restores the baselines of the in-progress hourly bucket so its hourly deltas survive restarts. */
+    private fun restoreBucketState() {
+        val last = mHistoryBuckets.lastOrNull() ?: return
+        if (prefs.getInt("bucket_start_day", Int.MIN_VALUE) == last.epochDay &&
+            prefs.getInt("bucket_start_hour", -1) == last.hour
+        ) {
+            bucketStartDrain = prefs.getInt("bucket_start_drain", 0)
+            bucketStartScreenOnMs = prefs.getLong("bucket_start_sot", 0L)
+        } else {
+            // Unknown baseline (e.g. data from an older version): derive it from the stored deltas.
+            bucketStartDrain = (last.drainPercent - last.hourlyDrainPercent).coerceAtLeast(0)
+            bucketStartScreenOnMs = (last.screenOnMs - last.hourlyScreenOnMs).coerceAtLeast(0L)
+        }
+        bucketMinCurrent = if (last.minCurrent != 0) last.minCurrent else Int.MAX_VALUE
+        bucketMaxCurrent = if (last.maxCurrent != 0) last.maxCurrent else Int.MIN_VALUE
+        bucketCurrentSum = 0L
+        bucketSampleCount = 0
+    }
+
+    private fun bucketEndWallMs(b: BatteryInsightHistoryBucket): Long = try {
+        LocalDate.ofEpochDay(b.epochDay.toLong())
+            .atTime(b.hour.coerceIn(0, 23), 0)
+            .atZone(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli() + 3_600_000L
+    } catch (_: Exception) {
+        Long.MAX_VALUE
+    }
+
+    private fun archiveSessionLocked(isChargingSession: Boolean) {
         try {
-            if (isChargingSession) {
-                val chargeFlow = mFlowSamples.filter { it.isCharging }
-                if (chargeFlow.isNotEmpty()) {
-                    mLastChargeFlowSamples.clear()
-                    mLastChargeFlowSamples.addAll(chargeFlow)
-                }
-                if (mHistoryBuckets.isNotEmpty()) {
-                    mLastChargeHistoryBuckets.clear()
-                    mLastChargeHistoryBuckets.addAll(mHistoryBuckets)
-                }
+            val since = segmentStartWallMs
+            val flow = mFlowSamples.filter { it.isCharging == isChargingSession && (since <= 0L || it.timestamp >= since) }
+            val buckets = mHistoryBuckets.filter { since <= 0L || bucketEndWallMs(it) > since }.map { it.copy() }
+            val (targetFlow, targetBuckets) = if (isChargingSession) {
+                mLastChargeFlowSamples to mLastChargeHistoryBuckets
             } else {
-                val dischargeFlow = mFlowSamples.filter { !it.isCharging }
-                if (dischargeFlow.isNotEmpty()) {
-                    mLastDischargeFlowSamples.clear()
-                    mLastDischargeFlowSamples.addAll(dischargeFlow)
-                }
-                if (mHistoryBuckets.isNotEmpty()) {
-                    mLastDischargeHistoryBuckets.clear()
-                    mLastDischargeHistoryBuckets.addAll(mHistoryBuckets)
-                }
+                mLastDischargeFlowSamples to mLastDischargeHistoryBuckets
             }
-            saveSessionArchives()
+            if (flow.isNotEmpty()) {
+                targetFlow.clear()
+                targetFlow.addAll(flow)
+            }
+            if (buckets.isNotEmpty()) {
+                targetBuckets.clear()
+                targetBuckets.addAll(buckets)
+            }
+            saveArchives(includeLastSessions = true)
         } catch (e: Exception) {
             Log.e(TAG, "Error archiving session", e)
         }
     }
 
-    private fun saveSessionArchives() {
-        scope.launch(Dispatchers.IO) {
-            try {
-                saveListToFile("active_flow.json", flowToJson(mFlowSamples))
-                saveListToFile("active_buckets.json", bucketsToJson(mHistoryBuckets))
-                saveListToFile("last_charge_flow.json", flowToJson(mLastChargeFlowSamples))
-                saveListToFile("last_charge_buckets.json", bucketsToJson(mLastChargeHistoryBuckets))
-                saveListToFile("last_discharge_flow.json", flowToJson(mLastDischargeFlowSamples))
-                saveListToFile("last_discharge_buckets.json", bucketsToJson(mLastDischargeHistoryBuckets))
-            } catch (e: Exception) {
-                Log.e(TAG, "Error saving session archives to disk", e)
-            }
+    /** Snapshots under the lock, writes on the IO dispatcher. */
+    private fun saveArchives(includeLastSessions: Boolean) {
+        val snapshot = synchronized(mCurrentStats) { ArchiveSnapshot.take(this, includeLastSessions) }
+        scope.launch(Dispatchers.IO) { snapshot.writeTo(storage) }
+    }
+
+    private class ArchiveSnapshot(
+        val activeFlow: List<BatteryInsightFlowSample>,
+        val activeBuckets: List<BatteryInsightHistoryBucket>,
+        val lastChargeFlow: List<BatteryInsightFlowSample>?,
+        val lastChargeBuckets: List<BatteryInsightHistoryBucket>?,
+        val lastDischargeFlow: List<BatteryInsightFlowSample>?,
+        val lastDischargeBuckets: List<BatteryInsightHistoryBucket>?,
+    ) {
+        companion object {
+            fun take(s: BatteryInsightService, includeLast: Boolean) = ArchiveSnapshot(
+                s.mFlowSamples.toList(),
+                s.mHistoryBuckets.map { it.copy() },
+                if (includeLast) s.mLastChargeFlowSamples.toList() else null,
+                if (includeLast) s.mLastChargeHistoryBuckets.map { it.copy() } else null,
+                if (includeLast) s.mLastDischargeFlowSamples.toList() else null,
+                if (includeLast) s.mLastDischargeHistoryBuckets.map { it.copy() } else null,
+            )
+        }
+
+        fun writeTo(storage: SessionStorage) {
+            storage.saveFlow(SessionStorage.ACTIVE_FLOW, activeFlow)
+            storage.saveBuckets(SessionStorage.ACTIVE_BUCKETS, activeBuckets)
+            lastChargeFlow?.let { storage.saveFlow(SessionStorage.LAST_CHARGE_FLOW, it) }
+            lastChargeBuckets?.let { storage.saveBuckets(SessionStorage.LAST_CHARGE_BUCKETS, it) }
+            lastDischargeFlow?.let { storage.saveFlow(SessionStorage.LAST_DISCHARGE_FLOW, it) }
+            lastDischargeBuckets?.let { storage.saveBuckets(SessionStorage.LAST_DISCHARGE_BUCKETS, it) }
         }
     }
 
     private fun restoreSessionArchives() {
         try {
-            val activeFlow = jsonToFlow(readStringFromFile("active_flow.json"))
+            val activeFlow = storage.loadFlow(SessionStorage.ACTIVE_FLOW)
             if (activeFlow.isNotEmpty() && mFlowSamples.isEmpty()) {
-                mFlowSamples.addAll(activeFlow)
+                mFlowSamples.addAll(activeFlow.takeLast(MAX_FLOW_SAMPLES))
             }
-            val activeBuckets = jsonToBuckets(readStringFromFile("active_buckets.json"))
+            val activeBuckets = storage.loadBuckets(SessionStorage.ACTIVE_BUCKETS)
             if (activeBuckets.isNotEmpty() && mHistoryBuckets.isEmpty()) {
-                mHistoryBuckets.addAll(activeBuckets)
+                mHistoryBuckets.addAll(activeBuckets.takeLast(MAX_HISTORY_BUCKETS))
             }
-            val lcFlow = jsonToFlow(readStringFromFile("last_charge_flow.json"))
-            if (lcFlow.isNotEmpty()) {
-                mLastChargeFlowSamples.clear()
-                mLastChargeFlowSamples.addAll(lcFlow)
-            }
-            val lcBuckets = jsonToBuckets(readStringFromFile("last_charge_buckets.json"))
-            if (lcBuckets.isNotEmpty()) {
-                mLastChargeHistoryBuckets.clear()
-                mLastChargeHistoryBuckets.addAll(lcBuckets)
-            }
-            val ldFlow = jsonToFlow(readStringFromFile("last_discharge_flow.json"))
-            if (ldFlow.isNotEmpty()) {
-                mLastDischargeFlowSamples.clear()
-                mLastDischargeFlowSamples.addAll(ldFlow)
-            }
-            val ldBuckets = jsonToBuckets(readStringFromFile("last_discharge_buckets.json"))
-            if (ldBuckets.isNotEmpty()) {
-                mLastDischargeHistoryBuckets.clear()
-                mLastDischargeHistoryBuckets.addAll(ldBuckets)
-            }
+            replaceIfNotEmpty(mLastChargeFlowSamples, storage.loadFlow(SessionStorage.LAST_CHARGE_FLOW))
+            replaceIfNotEmpty(mLastChargeHistoryBuckets, storage.loadBuckets(SessionStorage.LAST_CHARGE_BUCKETS))
+            replaceIfNotEmpty(mLastDischargeFlowSamples, storage.loadFlow(SessionStorage.LAST_DISCHARGE_FLOW))
+            replaceIfNotEmpty(mLastDischargeHistoryBuckets, storage.loadBuckets(SessionStorage.LAST_DISCHARGE_BUCKETS))
         } catch (e: Exception) {
             Log.e(TAG, "Error restoring session archives", e)
         }
     }
 
-    private fun saveListToFile(filename: String, content: String) {
-        try {
-            val file = File(filesDir, filename)
-            file.writeText(content)
-        } catch (_: Exception) {}
-    }
-
-    private fun readStringFromFile(filename: String): String {
-        return try {
-            val file = File(filesDir, filename)
-            if (file.exists() && file.canRead()) file.readText() else ""
-        } catch (_: Exception) { "" }
-    }
-
-    private fun flowToJson(list: List<BatteryInsightFlowSample>): String {
-        val arr = org.json.JSONArray()
-        for (item in list) {
-            val obj = org.json.JSONObject()
-            obj.put("t", item.timestamp)
-            obj.put("c", item.current)
-            obj.put("ch", item.isCharging)
-            obj.put("l", item.level)
-            obj.put("v", item.voltage)
-            obj.put("tp", item.temp)
-            arr.put(obj)
+    private fun <T> replaceIfNotEmpty(target: MutableList<T>, items: List<T>) {
+        if (items.isNotEmpty()) {
+            target.clear()
+            target.addAll(items)
         }
-        return arr.toString()
     }
 
-    private fun jsonToFlow(json: String): List<BatteryInsightFlowSample> {
-        if (json.isEmpty()) return emptyList()
-        val list = mutableListOf<BatteryInsightFlowSample>()
-        try {
-            val arr = org.json.JSONArray(json)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                list.add(BatteryInsightFlowSample(
-                    obj.optLong("t"),
-                    obj.optInt("c"),
-                    obj.optBoolean("ch"),
-                    obj.optInt("l"),
-                    obj.optInt("v"),
-                    obj.optInt("tp")
-                ))
-            }
-        } catch (_: Exception) {}
-        return list
-    }
+    // endregion
 
-    private fun bucketsToJson(list: List<BatteryInsightHistoryBucket>): String {
-        val arr = org.json.JSONArray()
-        for (b in list) {
-            val obj = org.json.JSONObject()
-            obj.put("d", b.epochDay)
-            obj.put("h", b.hour)
-            obj.put("sot", b.screenOnMs)
-            obj.put("dr", b.drainPercent)
-            obj.put("hdr", b.hourlyDrainPercent)
-            obj.put("hsot", b.hourlyScreenOnMs)
-            obj.put("min", b.minCurrent)
-            obj.put("max", b.maxCurrent)
-            obj.put("avg", b.avgCurrent)
-            obj.put("tp", b.temp)
-            arr.put(obj)
-        }
-        return arr.toString()
-    }
-
-    private fun jsonToBuckets(json: String): List<BatteryInsightHistoryBucket> {
-        if (json.isEmpty()) return emptyList()
-        val list = mutableListOf<BatteryInsightHistoryBucket>()
-        try {
-            val arr = org.json.JSONArray(json)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val b = BatteryInsightHistoryBucket(obj.optInt("d"), obj.optInt("h")).apply {
-                    screenOnMs = obj.optLong("sot")
-                    drainPercent = obj.optInt("dr")
-                    hourlyDrainPercent = obj.optInt("hdr")
-                    hourlyScreenOnMs = obj.optLong("hsot")
-                    minCurrent = obj.optInt("min")
-                    maxCurrent = obj.optInt("max")
-                    avgCurrent = obj.optInt("avg")
-                    temp = obj.optInt("tp")
-                }
-                list.add(b)
-            }
-        } catch (_: Exception) {}
-        return list
-    }
-
+    /**
+     * Root-only keep-alive tweaks. Deliberately does not chmod sysfs or inject SELinux rules: those
+     * would open the battery nodes to every untrusted app. Restricted nodes are read through the root
+     * shell instead (see ShellUtils.readSysfsSync).
+     */
     private fun applyRootImmortality() {
         scope.launch(Dispatchers.IO) {
+            if (!ShellUtils.isRootAvailable()) return@launch
             try {
                 val pid = android.os.Process.myPid()
                 val pkg = packageName
                 val commands = StringBuilder()
                 // 1. OOM score adj: Minimum -1000 (Protected from LowMemoryKiller)
                 commands.append("echo -1000 > /proc/$pid/oom_score_adj 2>/dev/null; ")
-                commands.append("echo -17 > /proc/$pid/oom_adj 2>/dev/null; ")
                 // 2. Battery & Doze Whitelisting
-                commands.append("dumpsys deviceidle whitelist +$pkg 2>/dev/null; ")
-                commands.append("cmd deviceidle whitelist +$pkg 2>/dev/null; ")
+                commands.append("cmd deviceidle whitelist +$pkg >/dev/null 2>&1 || dumpsys deviceidle whitelist +$pkg >/dev/null 2>&1; ")
                 // 3. Prevent process throttling / standby freezing
                 commands.append("am set-standby-bucket $pkg active 2>/dev/null; ")
                 commands.append("cmd activity set-inactive $pkg false 2>/dev/null; ")
@@ -685,39 +720,28 @@ class BatteryInsightService : Service() {
                 commands.append("cmd appops set $pkg START_FOREGROUND allow 2>/dev/null; ")
                 commands.append("cmd appops set $pkg AUTO_START allow 2>/dev/null; ")
                 commands.append("cmd appops set $pkg BOOT_COMPLETED allow 2>/dev/null; ")
-                // 5. Chmod 644 on power_supply nodes to enable ultra-fast direct Java reads (0.01ms)
-                commands.append("chmod -R 644 /sys/class/power_supply/* 2>/dev/null; ")
-                commands.append("chmod 755 /sys/class/power_supply /sys/class/power_supply/* 2>/dev/null; ")
-                // 6. Live SELinux policy injection for Magisk / KernelSU / APatch
-                commands.append("magiskpolicy --live 'allow untrusted_app sysfs_batteryinfo file { read open getattr }' 2>/dev/null; ")
-                commands.append("magiskpolicy --live 'allow untrusted_app sysfs file { read open getattr }' 2>/dev/null; ")
-                commands.append("supolicy --live 'allow untrusted_app sysfs_batteryinfo file { read open getattr }' 2>/dev/null; ")
-                commands.append("supolicy --live 'allow untrusted_app sysfs file { read open getattr }' 2>/dev/null; ")
-                ShellUtils.exec(commands.toString())
+                ShellUtils.execRoot(commands.toString())
             } catch (e: Exception) {
                 Log.e(TAG, "Error applying root immortality", e)
             }
         }
     }
 
-    private fun scheduleWatchdog() {
+    private fun watchdogPendingIntent(): PendingIntent {
+        val intent = Intent(this, WatchdogReceiver::class.java).apply { action = WATCHDOG_ACTION }
+        return PendingIntent.getBroadcast(
+            this,
+            9999,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun scheduleWatchdog(delayMs: Long = WATCHDOG_INTERVAL_MS) {
         try {
             val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-            val intent = Intent(this, BootReceiver::class.java).apply {
-                action = "com.acer.batteryinsight.WATCHDOG_KEEPALIVE"
-            }
-            val pendingIntent = PendingIntent.getBroadcast(
-                this,
-                9999,
-                intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            val triggerAt = SystemClock.elapsedRealtime() + (5 * 60 * 1000L)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
-            } else {
-                alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
-            }
+            val triggerAt = SystemClock.elapsedRealtime() + delayMs
+            alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, watchdogPendingIntent())
         } catch (_: Exception) {}
     }
 
@@ -731,27 +755,30 @@ class BatteryInsightService : Service() {
         }
     }
 
-    private fun startForegroundSafely() {
-        try {
-            val notif = createNotification()
+    /**
+     * Android 14+ uses only the specialUse type: dataSync is limited to 6h/day on Android 15+ and
+     * cannot be started from BOOT_COMPLETED, while this monitor runs continuously.
+     */
+    private fun startForegroundSafely(): Boolean {
+        return try {
+            val notif = createNotification(buildNotificationContent(snapshotStats()))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(
-                    NOTIF_ID,
-                    notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                )
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIF_ID,
-                    notif,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                )
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             } else {
-                startForeground(NOTIF_ID, notif)
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             }
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Error in startForegroundSafely", e)
+            false
         }
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        // Only reachable if a time-limited type was used; the system requires the service to stop.
+        Log.w(TAG, "Foreground service timeout (type=$fgsType), stopping")
+        scheduleWatchdog()
+        stopSelf()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -760,11 +787,16 @@ class BatteryInsightService : Service() {
                 resetStatsInternal("Reset on device reboot")
             }
         }
-        startForegroundSafely()
+        if (!startForegroundSafely()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
+
+    // region Hardware reading
 
     private fun detectHardwarePaths() {
         try {
@@ -851,10 +883,11 @@ class BatteryInsightService : Service() {
                 }
             }
 
+            // charge_counter is deliberately absent: it is the *remaining* charge, not the full
+            // capacity. It is used below (scaled by level) only when no full-capacity node exists.
             val fullCandidates = listOf(
                 "$batteryBasePath/charge_full",
                 "/sys/class/power_supply/bms/charge_full",
-                "$batteryBasePath/charge_counter",
                 "/sys/class/power_supply/battery/charge_full"
             )
             for (path in fullCandidates) {
@@ -876,24 +909,8 @@ class BatteryInsightService : Service() {
         } catch (_: Exception) {}
     }
 
-    private fun loadSettingsIntoStats() {
-        synchronized(mCurrentStats) {
-            mCurrentStats.isNotificationEnabled = prefs.getBoolean("battery_insight_notif_enabled", true)
-            mCurrentStats.monitorInterval = prefs.getInt("battery_insight_monitor_interval", 10000)
-            mCurrentStats.isAutoResetLevelEnabled = prefs.getBoolean("battery_insight_auto_reset_level_enabled", false)
-            mCurrentStats.autoResetLevel = prefs.getInt("battery_insight_auto_reset_level", 100)
-            mCurrentStats.isResetOnPlugged = prefs.getBoolean("battery_insight_reset_on_plugged", false)
-            mCurrentStats.isResetOnReboot = prefs.getBoolean("battery_insight_reset_on_reboot", false)
-            mCurrentStats.isBatteryAlarmEnabled = prefs.getBoolean("battery_insight_battery_alarm_enabled", false)
-            mCurrentStats.batteryLowThreshold = prefs.getInt("battery_insight_battery_low_threshold", 20)
-            mCurrentStats.batteryHighThreshold = prefs.getInt("battery_insight_battery_high_threshold", 80)
-            mCurrentStats.alarmFrequency = prefs.getInt("battery_insight_alarm_frequency", 0)
-            mCurrentStats.isFullChargeAlarmEnabled = prefs.getBoolean("battery_insight_full_charge_alarm_enabled", false)
-            mCurrentStats.isZeroCurrentAlarmEnabled = prefs.getBoolean("battery_insight_zero_current_alarm_enabled", false)
-            mCurrentStats.batteryAlarmSound = prefs.getString("battery_insight_battery_alarm_sound", null)
-            mCurrentStats.isBatteryAlarmVibrate = prefs.getBoolean("battery_insight_battery_alarm_vibrate", false)
-        }
-    }
+    private fun readSysfsInt(path: String): Int =
+        ShellUtils.readSysfsSync(path)?.trim()?.toIntOrNull() ?: 0
 
     private fun readSysfsCapacity(): Int {
         val candidates = listOf(
@@ -903,42 +920,43 @@ class BatteryInsightService : Service() {
             "/sys/class/power_supply/sec-battery/capacity",
             "/sys/class/power_supply/qcom-battery/capacity",
             "/sys/class/power_supply/main/capacity"
-        )
+        ).distinct()
         for (path in candidates) {
             val cap = readSysfsInt(path)
-            if (cap in 1..100) return cap
+            if (BatteryLevelValidator.isValid(cap)) return cap
         }
         return -1
     }
 
-    private fun resolveValidBatteryLevel(intentLevel: Int): Int {
-        // 1. Intent EXTRA_LEVEL check (with spurious 0% drop filter)
-        if (intentLevel in 1..100) {
-            if (lastBatteryLevel in 15..100 && intentLevel <= 2 && !isCharging && !isPlugged) {
-                val sysCap = readSysfsCapacity()
-                if (sysCap in 1..100) return sysCap
-                val bmCap = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
-                if (bmCap in 1..100) return bmCap
-            }
-            return intentLevel
+    private fun batteryManagerCapacity(): Int =
+        try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
+
+    /** Validates a level reading against history and independent sources (see BatteryLevelValidator). */
+    private fun acceptLevelLocked(primary: Int): Int =
+        levelValidator.accept(primary, System.currentTimeMillis()) {
+            listOf(batteryManagerCapacity(), readSysfsCapacity())
         }
 
-        // 2. BatteryManager property check
-        val bmCap = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) } catch (_: Exception) { -1 }
-        if (bmCap in 1..100) return bmCap
+    // endregion
 
-        // 3. Direct Sysfs capacity node check
-        val sysCap = readSysfsCapacity()
-        if (sysCap in 1..100) return sysCap
-
-        // 4. Last known valid level check
-        if (lastBatteryLevel in 1..100) return lastBatteryLevel
-        if (mCurrentStats.level in 1..100) return mCurrentStats.level
-
-        return 100
+    private fun loadSettingsIntoStats() {
+        mCurrentStats.isNotificationEnabled = prefs.getBoolean("battery_insight_notif_enabled", true)
+        mCurrentStats.monitorInterval = prefs.getInt("battery_insight_monitor_interval", DEFAULT_MONITOR_INTERVAL_MS)
+        mCurrentStats.isAutoResetLevelEnabled = prefs.getBoolean("battery_insight_auto_reset_level_enabled", false)
+        mCurrentStats.autoResetLevel = prefs.getInt("battery_insight_auto_reset_level", 100)
+        mCurrentStats.isResetOnPlugged = prefs.getBoolean("battery_insight_reset_on_plugged", false)
+        mCurrentStats.isResetOnReboot = prefs.getBoolean("battery_insight_reset_on_reboot", false)
+        mCurrentStats.isBatteryAlarmEnabled = prefs.getBoolean("battery_insight_battery_alarm_enabled", false)
+        mCurrentStats.batteryLowThreshold = prefs.getInt("battery_insight_battery_low_threshold", 20)
+        mCurrentStats.batteryHighThreshold = prefs.getInt("battery_insight_battery_high_threshold", 80)
+        mCurrentStats.alarmFrequency = prefs.getInt("battery_insight_alarm_frequency", 0)
+        mCurrentStats.isFullChargeAlarmEnabled = prefs.getBoolean("battery_insight_full_charge_alarm_enabled", false)
+        mCurrentStats.isZeroCurrentAlarmEnabled = prefs.getBoolean("battery_insight_zero_current_alarm_enabled", false)
+        mCurrentStats.batteryAlarmSound = prefs.getString("battery_insight_battery_alarm_sound", null)
+        mCurrentStats.isBatteryAlarmVibrate = prefs.getBoolean("battery_insight_battery_alarm_vibrate", false)
     }
 
-    private fun handleBatteryChanged(intent: Intent) {
+    private fun handleBatteryChangedLocked(intent: Intent) {
         val rawLevel = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
         val level = if (rawLevel >= 0 && scale > 0) (rawLevel * 100) / scale else rawLevel
@@ -949,96 +967,105 @@ class BatteryInsightService : Service() {
         val health = intent.getIntExtra(BatteryManager.EXTRA_HEALTH, -1)
 
         isPlugged = plugged != 0
+        batteryStatus = status
         isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL || isPlugged
 
-        val validLevel = resolveValidBatteryLevel(level)
+        val validLevel = acceptLevelLocked(level)
+        if (BatteryLevelValidator.isValid(validLevel)) {
+            applyLevelChangeLocked(validLevel)
+            mCurrentStats.level = validLevel
+        }
 
-        if (lastBatteryLevel in 1..100) {
+        mCurrentStats.status = status
+        mCurrentStats.plugged = plugged
+        mCurrentStats.isCharging = isCharging
+        if (voltage > 0) mCurrentStats.voltage = voltage
+        if (temp > 0) mCurrentStats.temp = temp
+        mCurrentStats.health = when (health) {
+            BatteryManager.BATTERY_HEALTH_GOOD -> "Good"
+            BatteryManager.BATTERY_HEALTH_OVERHEAT -> "Overheat"
+            BatteryManager.BATTERY_HEALTH_DEAD -> "Dead"
+            BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "Over Voltage"
+            BatteryManager.BATTERY_HEALTH_COLD -> "Cold"
+            BatteryManager.BATTERY_HEALTH_UNSPECIFIED_FAILURE -> "Failure"
+            else -> "Unknown"
+        }
+        fillStatsLocked(recordSample = false)
+
+        checkAlarmsLocked(System.currentTimeMillis())
+    }
+
+    /** Attributes a validated level change to screen-on/off drain or charge, handles auto reset. */
+    private fun applyLevelChangeLocked(validLevel: Int) {
+        if (BatteryLevelValidator.isValid(lastBatteryLevel)) {
             val diff = abs(validLevel - lastBatteryLevel)
-            // Filter out impossible instant drops (e.g. >30% drop in one broadcast cycle)
+            // Large jumps happen when the service was not running (e.g. device off); they are not
+            // attributable to the current screen state.
             if (diff < 30 || isCharging) {
                 if (validLevel < lastBatteryLevel) {
                     val drop = lastBatteryLevel - validLevel
-                    if (isScreenOn) {
-                        accumDischargeOn += drop
-                    } else {
-                        accumDischargeOff += drop
-                    }
+                    if (isScreenOn) accumDischargeOn += drop else accumDischargeOff += drop
                 } else if (validLevel > lastBatteryLevel) {
                     val gain = validLevel - lastBatteryLevel
-                    if (isScreenOn) {
-                        accumChargeOn += gain
-                    } else {
-                        accumChargeOff += gain
-                    }
+                    if (isScreenOn) accumChargeOn += gain else accumChargeOff += gain
                 }
             }
         }
 
         if (prefs.getBoolean("battery_insight_auto_reset_level_enabled", false)) {
             val target = prefs.getInt("battery_insight_auto_reset_level", 100)
-            if (validLevel >= target && lastBatteryLevel in 1..100 && lastBatteryLevel < target) {
+            if (validLevel >= target && BatteryLevelValidator.isValid(lastBatteryLevel) && lastBatteryLevel < target) {
                 resetStatsInternal("Auto reset at level $target%")
             }
         }
 
         lastBatteryLevel = validLevel
         saveSessionState()
-
-        synchronized(mCurrentStats) {
-            mCurrentStats.level = validLevel
-            mCurrentStats.status = status
-            mCurrentStats.plugged = plugged
-            mCurrentStats.isCharging = isCharging
-            if (voltage > 0) mCurrentStats.voltage = voltage
-            if (temp > 0) mCurrentStats.temp = temp
-            mCurrentStats.health = when (health) {
-                BatteryManager.BATTERY_HEALTH_GOOD -> "Good"
-                BatteryManager.BATTERY_HEALTH_OVERHEAT -> "Overheat"
-                BatteryManager.BATTERY_HEALTH_DEAD -> "Dead"
-                BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "Over Voltage"
-                BatteryManager.BATTERY_HEALTH_COLD -> "Cold"
-                else -> "Good"
-            }
-            fillStatsLocked()
-        }
-
-        checkAlarms(validLevel, isCharging)
     }
 
-    private fun handleScreenStateChange(screenOn: Boolean) {
+    /**
+     * Adds the time since the last screen/power transition to the screen-on/off counters.
+     * @param countAsCharging whether that interval belongs to the charging counters.
+     */
+    private fun accumulateScreenTimeLocked(countAsCharging: Boolean) {
         val nowRealtime = SystemClock.elapsedRealtime()
         val nowUptime = SystemClock.uptimeMillis()
-
         val deltaRealtime = max(0L, nowRealtime - lastScreenStateChangeRealtime)
         val deltaUptime = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRealtime)
         val deltaDeepSleep = max(0L, deltaRealtime - deltaUptime)
 
         if (isScreenOn) {
             accumScreenOnMs += deltaRealtime
+            if (countAsCharging) accumChargeScreenOnMs += deltaRealtime
         } else {
             accumScreenOffMs += deltaRealtime
             accumAwakeMs += deltaUptime
             accumDeepSleepMs += deltaDeepSleep
+            if (countAsCharging) accumChargeScreenOffMs += deltaRealtime
         }
-
-        if (isCharging || isPlugged) {
-            if (isScreenOn) {
-                accumChargeScreenOnMs += deltaRealtime
-            } else {
-                accumChargeScreenOffMs += deltaRealtime
-            }
-        }
-
-        isScreenOn = screenOn
         lastScreenStateChangeRealtime = nowRealtime
         lastScreenStateChangeUptime = nowUptime
+    }
+
+    private fun handleScreenStateChangeLocked(screenOn: Boolean) {
+        accumulateScreenTimeLocked(countAsCharging = isCharging || isPlugged)
+        isScreenOn = screenOn
         saveSessionState()
     }
 
-    private fun fillStatsLocked() {
-        if (mCurrentStats.level <= 0) {
-            mCurrentStats.level = resolveValidBatteryLevel(-1)
+    /**
+     * Recomputes derived statistics.
+     * @param recordSample whether this call contributes to min/max/avg current statistics; only the
+     *        monitor loop records samples so UI polling and broadcasts don't skew them.
+     */
+    private fun fillStatsLocked(recordSample: Boolean) {
+        if (!BatteryLevelValidator.isValid(mCurrentStats.level)) {
+            val resolved = acceptLevelLocked(-1)
+            mCurrentStats.level = when {
+                BatteryLevelValidator.isValid(resolved) -> resolved
+                BatteryLevelValidator.isValid(lastBatteryLevel) -> lastBatteryLevel
+                else -> 100
+            }
         }
 
         val nowRealtime = SystemClock.elapsedRealtime()
@@ -1054,16 +1081,9 @@ class BatteryInsightService : Service() {
         val curAwake = accumAwakeMs + if (!isScreenOn) curDeltaUp else 0L
         val curDeepSleep = accumDeepSleepMs + if (!isScreenOn) curDeltaDs else 0L
 
-        val curChargeScreenOn = if (isCharging || isPlugged) {
-            accumChargeScreenOnMs + if (isScreenOn) curDeltaRt else 0L
-        } else {
-            accumChargeScreenOnMs
-        }
-        val curChargeScreenOff = if (isCharging || isPlugged) {
-            accumChargeScreenOffMs + if (!isScreenOn) curDeltaRt else 0L
-        } else {
-            accumChargeScreenOffMs
-        }
+        val chargingNow = isCharging || isPlugged
+        val curChargeScreenOn = accumChargeScreenOnMs + if (chargingNow && isScreenOn) curDeltaRt else 0L
+        val curChargeScreenOff = accumChargeScreenOffMs + if (chargingNow && !isScreenOn) curDeltaRt else 0L
 
         mCurrentStats.screenOnTime = curScreenOn
         mCurrentStats.screenOffTime = curScreenOff
@@ -1085,27 +1105,30 @@ class BatteryInsightService : Service() {
         val chargeHoursTotal = (curChargeScreenOn + curChargeScreenOff) / 3600000f
         if (chargeHoursTotal >= 0.016f && totalChargeGain > 0) {
             mCurrentStats.chargeRate = totalChargeGain / chargeHoursTotal
-        } else if (isCharging || isPlugged) {
+        } else if (chargingNow) {
             mCurrentStats.chargeRate = 0f
         }
 
         // 1. Hardware Fuelgauge Current: Prioritize verified sysfs hardware reading
         val curPath = verifiedCurrentNowPath
-        val curRaw = if (curPath != null) readSysfsInt(curPath) else 0
-        val currentNowUa = if (curRaw != 0) {
-            curRaw
+        val sysfsRaw = if (curPath != null) readSysfsInt(curPath) else 0
+        val rawCurrentMa = if (sysfsRaw != 0) {
+            currentNormalizer.toMilliAmps(sysfsRaw, CurrentNormalizer.Source.SYSFS)
         } else {
-            try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) } catch (_: Exception) { 0 }
+            val bmRaw = try { batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) } catch (_: Exception) { 0 }
+            // Integer.MIN_VALUE means "not supported".
+            if (bmRaw == Int.MIN_VALUE) 0 else currentNormalizer.toMilliAmps(bmRaw, CurrentNormalizer.Source.BATTERY_MANAGER)
         }
-        val rawCurrentMa = if (abs(currentNowUa) > 10000) currentNowUa / 1000 else currentNowUa
-        val currentNowMa = if (isCharging || isPlugged) {
-            abs(rawCurrentMa)
-        } else {
-            -abs(rawCurrentMa)
-        }
+        val currentNowMa = currentNormalizer.signed(
+            rawMa = rawCurrentMa,
+            plugged = chargingNow,
+            discharging = batteryStatus == BatteryManager.BATTERY_STATUS_DISCHARGING,
+            charging = batteryStatus == BatteryManager.BATTERY_STATUS_CHARGING,
+            level = mCurrentStats.level,
+        )
         mCurrentStats.currentNow = currentNowMa
 
-        if (currentNowMa != 0) {
+        if (recordSample && currentNowMa != 0) {
             if (currentNowMa < minCurrent) minCurrent = currentNowMa
             if (currentNowMa > maxCurrent) maxCurrent = currentNowMa
             totalCurrentSum += currentNowMa
@@ -1115,22 +1138,24 @@ class BatteryInsightService : Service() {
         mCurrentStats.maxCurrent = if (maxCurrent == Int.MIN_VALUE) 0 else maxCurrent
         mCurrentStats.avgCurrent = if (sampleCount > 0) (totalCurrentSum / sampleCount).toInt() else currentNowMa
 
-        if ((isCharging || isPlugged) && currentNowMa > 0) {
+        if (recordSample && chargingNow && currentNowMa > 0) {
             chargeCurrentSum += currentNowMa
             chargeSampleCount++
         }
-        mCurrentStats.chargeCurrentAvg = if (chargeSampleCount > 0) (chargeCurrentSum / chargeSampleCount).toInt() else if (isCharging || isPlugged) abs(currentNowMa) else 0
+        mCurrentStats.chargeCurrentAvg = if (chargeSampleCount > 0) (chargeCurrentSum / chargeSampleCount).toInt() else if (chargingNow) abs(currentNowMa) else 0
 
         mCurrentStats.powerWatts = (abs(currentNowMa) * mCurrentStats.voltage) / 1000000f
 
         // 2. Hardware Battery Capacity & Health: Use cached static properties, refresh periodically
         if (nowRealtime - lastStaticStatsCheckRealtime > 300000L || cachedDesignCapacity <= 0 || cachedChargeFull <= 0) {
-            refreshStaticBatteryInfo()
+            if (nowRealtime - lastStaticStatsCheckRealtime > 60000L || lastStaticStatsCheckRealtime == 0L) {
+                refreshStaticBatteryInfo()
+            }
         }
 
-        var capDesign = cachedDesignCapacity
+        val capDesign = cachedDesignCapacity
         var capFull = cachedChargeFull
-        var cycles = cachedCycleCount
+        val cycles = cachedCycleCount
         mCurrentStats.cycleCount = cycles
 
         // Fallback: Hardware Charge Counter for current full capacity estimation
@@ -1164,37 +1189,17 @@ class BatteryInsightService : Service() {
         }
     }
 
-    private fun readSysfsInt(path: String): Int {
-        // Direct file read (fastest, 0.01ms)
-        try {
-            val file = File(path)
-            if (file.exists() && file.canRead()) {
-                val v = file.readText().trim().toIntOrNull()
-                if (v != null) return v
-            }
-        } catch (_: Exception) {}
-
-        // Root / Shell fallback using LibSU active shell or sh
-        try {
-            val str = ShellUtils.readSysfsSync(path)
-            if (!str.isNullOrEmpty()) {
-                val v = str.trim().toIntOrNull()
-                if (v != null) return v
-            }
-        } catch (_: Exception) {}
-
-        return 0
-    }
+    private fun snapshotStats(): BatteryInsightStats = synchronized(mCurrentStats) { mCurrentStats.copy() }
 
     private fun startMonitorLoop() {
-        scope.launch {
-            var loopCount = 0
+        if (monitorJob?.isActive == true) return
+        monitorJob = scope.launch(stateDispatcher) {
             while (isActive) {
                 val now = System.currentTimeMillis()
 
                 try {
                     synchronized(mCurrentStats) {
-                        fillStatsLocked()
+                        fillStatsLocked(recordSample = true)
 
                         if (now - lastFlowSampleTime >= FLOW_SAMPLE_INTERVAL_MS) {
                             val sample = BatteryInsightFlowSample(
@@ -1206,53 +1211,56 @@ class BatteryInsightService : Service() {
                                 mCurrentStats.temp
                             )
                             mFlowSamples.add(sample)
-                            if (mFlowSamples.size > MAX_FLOW_SAMPLES) mFlowSamples.removeAt(0)
+                            while (mFlowSamples.size > MAX_FLOW_SAMPLES) mFlowSamples.removeAt(0)
                             lastFlowSampleTime = now
 
                             updateHistoryBucketLocked(now)
                         }
-                    }
 
-                    checkAlarms(mCurrentStats.level, mCurrentStats.isCharging)
+                        checkAlarmsLocked(now)
+                    }
 
                     if (mCurrentStats.isNotificationEnabled) {
                         updateNotification()
                     }
 
-                    if (now - lastSessionSaveTime >= 30000L) {
+                    if (now - lastSessionSaveTime >= SESSION_SAVE_INTERVAL_MS) {
                         lastSessionSaveTime = now
-                        saveSessionState()
-                        saveSessionArchives()
+                        synchronized(mCurrentStats) { saveSessionState() }
+                        saveArchives(includeLastSessions = false)
                     }
 
                     // Periodic re-assertion of root immortality and watchdog keep-alive
-                    if (now - lastOomScoreTime >= 15000L) {
-                        lastOomScoreTime = now
-                        ShellUtils.exec("echo -1000 > /proc/${android.os.Process.myPid()}/oom_score_adj 2>/dev/null")
+                    if (ShellUtils.isRootAvailable()) {
+                        if (now - lastImmortalityTime >= IMMORTALITY_INTERVAL_MS) {
+                            lastImmortalityTime = now
+                            lastOomScoreTime = now
+                            applyRootImmortality()
+                        } else if (now - lastOomScoreTime >= OOM_REASSERT_INTERVAL_MS) {
+                            lastOomScoreTime = now
+                            ShellUtils.execRoot("echo -1000 > /proc/${android.os.Process.myPid()}/oom_score_adj 2>/dev/null")
+                        }
                     }
 
-                    if (now - lastWatchdogTime >= 300000L) {
+                    if (now - lastWatchdogTime >= WATCHDOG_INTERVAL_MS) {
                         lastWatchdogTime = now
                         scheduleWatchdog()
-                        applyRootImmortality()
                         checkBackgroundUpdates(0L)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in monitor loop", e)
                 }
 
-                loopCount++
-                val interval = prefs.getInt("battery_insight_monitor_interval", 1000).coerceAtLeast(1000).toLong()
+                val interval = prefs.getInt("battery_insight_monitor_interval", DEFAULT_MONITOR_INTERVAL_MS).coerceAtLeast(1000).toLong()
                 delay(interval)
             }
         }
     }
 
     private fun updateHistoryBucketLocked(now: Long) {
-        val cal = Calendar.getInstance()
-        cal.timeInMillis = now
-        val epochDay = (now / 86400000L).toInt()
-        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val local = Instant.ofEpochMilli(now).atZone(ZoneId.systemDefault())
+        val epochDay = local.toLocalDate().toEpochDay().toInt()
+        val hour = local.hour
 
         val totalDrain = mCurrentStats.batteryDrainScreenOn + mCurrentStats.batteryDrainScreenOff
         val totalSot = mCurrentStats.screenOnTime
@@ -1262,24 +1270,61 @@ class BatteryInsightService : Service() {
             bucket = BatteryInsightHistoryBucket(epochDay, hour)
             bucketStartDrain = totalDrain
             bucketStartScreenOnMs = totalSot
+            bucketMinCurrent = Int.MAX_VALUE
+            bucketMaxCurrent = Int.MIN_VALUE
+            bucketCurrentSum = 0L
+            bucketSampleCount = 0
             mHistoryBuckets.add(bucket)
-            if (mHistoryBuckets.size > MAX_HISTORY_BUCKETS) mHistoryBuckets.removeAt(0)
+            while (mHistoryBuckets.size > MAX_HISTORY_BUCKETS) mHistoryBuckets.removeAt(0)
         }
+
+        val current = mCurrentStats.currentNow
+        if (current != 0) {
+            if (current < bucketMinCurrent) bucketMinCurrent = current
+            if (current > bucketMaxCurrent) bucketMaxCurrent = current
+            bucketCurrentSum += current
+            bucketSampleCount++
+        }
+
         bucket.screenOnMs = totalSot
         bucket.drainPercent = totalDrain
         bucket.hourlyDrainPercent = (totalDrain - bucketStartDrain).coerceAtLeast(0)
         bucket.hourlyScreenOnMs = (totalSot - bucketStartScreenOnMs).coerceAtLeast(0L)
-        if (mCurrentStats.minCurrent != Int.MAX_VALUE && mCurrentStats.minCurrent != 0) {
-            bucket.minCurrent = mCurrentStats.minCurrent
+        if (bucketMinCurrent != Int.MAX_VALUE) bucket.minCurrent = bucketMinCurrent
+        if (bucketMaxCurrent != Int.MIN_VALUE) bucket.maxCurrent = bucketMaxCurrent
+        if (bucketSampleCount > 0) {
+            bucket.avgCurrent = (bucketCurrentSum / bucketSampleCount).toInt()
+        } else if (bucket.avgCurrent == 0) {
+            bucket.avgCurrent = current
         }
-        if (mCurrentStats.maxCurrent != Int.MIN_VALUE && mCurrentStats.maxCurrent != 0) {
-            bucket.maxCurrent = mCurrentStats.maxCurrent
-        }
-        bucket.avgCurrent = mCurrentStats.avgCurrent
         bucket.temp = mCurrentStats.temp
     }
 
-    private data class SubsystemInfo(val key: String, val uid: Int, val pkg: String, val label: String)
+    // region App usage
+
+    private fun maybeRefreshAppUsages() {
+        val stale = mAppUsages.isEmpty() || System.currentTimeMillis() - lastAppUsageFetchMs >= APP_USAGE_REFRESH_MS
+        if (stale && appUsageFetchInFlight.compareAndSet(false, true)) {
+            scope.launch {
+                try {
+                    fetchAppUsages()
+                } finally {
+                    lastAppUsageFetchMs = System.currentTimeMillis()
+                    appUsageFetchInFlight.set(false)
+                }
+            }
+        }
+    }
+
+    private fun subsystemLabel(key: String): Pair<Int, String> = when (key) {
+        "screen" -> -1 to getString(R.string.battery_insight_subsystem_screen)
+        "cellular" -> -2 to getString(R.string.battery_insight_subsystem_cellular)
+        "wifi" -> -3 to "Wi-Fi"
+        "bluetooth" -> -4 to "Bluetooth"
+        "idle" -> -5 to getString(R.string.battery_insight_subsystem_idle)
+        "camera" -> -6 to getString(R.string.battery_insight_subsystem_camera)
+        else -> -7 to getString(R.string.battery_insight_subsystem_audio)
+    }
 
     private suspend fun fetchAppUsages() = withContext(Dispatchers.IO) {
         try {
@@ -1323,206 +1368,79 @@ class BatteryInsightService : Service() {
                 }
             } catch (_: Exception) {}
 
-            // Streamlined dumpsys: filter in shell to prevent massive 50MB string allocations
-            var lines = ShellUtils.exec("dumpsys batterystats --charged | grep -E -A 120 'Estimated (power|battery) use' || dumpsys batterystats --charged")
+            // Filter in the shell to avoid allocating the whole (tens of MB) dumpsys output.
+            var lines = ShellUtils.exec("dumpsys batterystats --charged | grep -E -A 400 'Estimated (power|battery) use' || dumpsys batterystats --charged")
             if (lines.none { it.contains("Estimated", ignoreCase = true) }) {
-                lines = ShellUtils.exec("dumpsys batterystats | grep -E -A 120 'Estimated (power|battery) use' || dumpsys batterystats")
+                lines = ShellUtils.exec("dumpsys batterystats | grep -E -A 400 'Estimated (power|battery) use' || dumpsys batterystats")
             }
 
-            fun parseDurationMs(durationStr: String): Long {
-                if (durationStr.isBlank()) return 0L
-                var totalMs = 0L
-                val dMatch = Regex("""(\d+(?:\.\d+)?)\s*d""").find(durationStr)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-                val hMatch = Regex("""(\d+(?:\.\d+)?)\s*h""").find(durationStr)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-                val mMatch = Regex("""(\d+(?:\.\d+)?)\s*m(?!s)""").find(durationStr)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-                val sMatch = Regex("""(\d+(?:\.\d+)?)\s*s""").find(durationStr)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-                val msMatch = Regex("""(\d+(?:\.\d+)?)\s*ms""").find(durationStr)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-
-                totalMs += (dMatch * 86400000.0).toLong()
-                totalMs += (hMatch * 3600000.0).toLong()
-                totalMs += (mMatch * 60000.0).toLong()
-                totalMs += (sMatch * 1000.0).toLong()
-                totalMs += msMatch.toLong()
-
-                if (totalMs == 0L) {
-                    val directNum = durationStr.trim().toLongOrNull()
-                    if (directNum != null) return directNum
-                }
-                return totalMs
-            }
-
+            val totalCapacity = synchronized(mCurrentStats) { mCurrentStats.totalCapacity }
+            val screenOnTime = synchronized(mCurrentStats) { mCurrentStats.screenOnTime }
+            val screenOffTime = synchronized(mCurrentStats) { mCurrentStats.screenOffTime }
+            val parsed = BatteryStatsParser.parse(lines, totalCapacity.toDouble().coerceAtLeast(3000.0))
             val resultMap = linkedMapOf<String, BatteryInsightAppUsage>()
-            var inPowerSection = false
-            val batteryCapacityLimit = mCurrentStats.totalCapacity.toDouble().coerceAtLeast(3000.0)
 
-            // Universal Regex across MIUI, HyperOS, OneUI, ColorOS, OxygenOS, LineageOS & AOSP
-            val uidPattern = Regex("""^\s*(?:UID\s+|Uid\s+)?(?:u(\d+)[_a](\d+)|u(\d+)[_i](\d+)|(\d+)):\s*([\d.]+)""", RegexOption.IGNORE_CASE)
-            val globalItemPattern = Regex("""^\s*(screen|screen_on|mobile_radio|cellular|cell|radio|modem|wifi|wi-fi|bluetooth|bt|camera|audio|sound|video|media|idle|standby|device_idle|gnss|gps|location|sensors|sensor|wakelock|wake_lock|phone|telephony):\s*([\d.]+)(?:.*duration:\s*([^\n]+))?""", RegexOption.IGNORE_CASE)
+            for (sub in parsed.subsystems) {
+                val existing = resultMap[sub.key]
+                if (existing != null) {
+                    existing.consumedPowerMah = maxOf(existing.consumedPowerMah, sub.powerMah)
+                    if (sub.durationMs > 0) existing.foregroundTimeMs = maxOf(existing.foregroundTimeMs, sub.durationMs)
+                } else {
+                    val (uid, label) = subsystemLabel(sub.key)
+                    resultMap[sub.key] = BatteryInsightAppUsage().apply {
+                        this.uid = uid
+                        this.packageName = sub.key
+                        this.appLabel = label
+                        this.consumedPowerMah = sub.powerMah
+                        this.foregroundTimeMs = if (sub.key == "screen" && sub.durationMs <= 0) screenOnTime else sub.durationMs
+                        this.backgroundTimeMs = if (sub.key == "idle" && sub.durationMs <= 0) screenOffTime else 0L
+                    }
+                }
+            }
 
-            for (line in lines) {
-                if (line.contains("Estimated power use (mAh):", ignoreCase = true) ||
-                    line.contains("Estimated power use:", ignoreCase = true) ||
-                    line.contains("Estimated battery use:", ignoreCase = true)) {
-                    inPowerSection = true
-                    continue
+            for (entry in parsed.uids) {
+                val realUid = entry.uid
+                var (pkgName, label) = when (realUid) {
+                    0 -> Pair("kernel", getString(R.string.battery_insight_process_kernel))
+                    1000 -> Pair("android", getString(R.string.battery_insight_process_android))
+                    1001, 1073 -> Pair("com.android.phone", getString(R.string.battery_insight_process_phone))
+                    1041 -> Pair("audioserver", getString(R.string.battery_insight_process_audio))
+                    1047 -> Pair("cameraserver", getString(R.string.battery_insight_process_camera))
+                    1036 -> Pair("webview", "Android WebView")
+                    else -> appMap[realUid] ?: Pair("", "")
                 }
 
-                if (inPowerSection) {
-                    if (line.isNotEmpty() && !line.startsWith(" ") && !line.startsWith("\t")) {
-                        break
+                if (pkgName.isEmpty()) {
+                    val pkgs = try { pm.getPackagesForUid(realUid) } catch (_: Exception) { null }
+                    pkgName = pkgs?.firstOrNull() ?: ""
+                    if (pkgName.isEmpty()) {
+                        pkgName = "uid.$realUid"
+                        label = "UID $realUid"
+                    } else {
+                        label = try {
+                            val ai = pm.getApplicationInfo(pkgName, 0)
+                            pm.getApplicationLabel(ai).toString()
+                        } catch (_: Exception) {
+                            pkgName
+                        }
                     }
+                    appMap[realUid] = Pair(pkgName, label)
+                }
 
-                    // 1. Check Global / Hardware Subsystems (MIUI / OneUI / AOSP / ColorOS)
-                    val globalMap = globalItemPattern.find(line)
-                    if (globalMap != null) {
-                        val rawComponent = globalMap.groupValues[1].lowercase()
-                        val power = globalMap.groupValues[2].toDoubleOrNull() ?: 0.0
-                        val durationStr = globalMap.groupValues.getOrNull(3) ?: ""
-                        val durationMs = if (durationStr.isNotEmpty()) parseDurationMs(durationStr) else 0L
-
-                        if (power > 0.05 && power <= batteryCapacityLimit) {
-                            val sub = when {
-                                rawComponent.contains("screen") -> {
-                                    SubsystemInfo("screen", -1, "screen", getString(R.string.battery_insight_subsystem_screen))
-                                }
-                                rawComponent.contains("mobile") || rawComponent.contains("cell") || rawComponent.contains("radio") || rawComponent.contains("modem") -> {
-                                    SubsystemInfo("cellular", -2, "cellular", getString(R.string.battery_insight_subsystem_cellular))
-                                }
-                                rawComponent.contains("wifi") || rawComponent.contains("wi-fi") -> {
-                                    SubsystemInfo("wifi", -3, "wifi", "Wi-Fi")
-                                }
-                                rawComponent.contains("bluetooth") || rawComponent.contains("bt") -> {
-                                    SubsystemInfo("bluetooth", -4, "bluetooth", "Bluetooth")
-                                }
-                                rawComponent.contains("idle") || rawComponent.contains("standby") -> {
-                                    SubsystemInfo("idle", -5, "idle", getString(R.string.battery_insight_subsystem_idle))
-                                }
-                                rawComponent.contains("camera") -> {
-                                    SubsystemInfo("camera", -6, "camera", getString(R.string.battery_insight_subsystem_camera))
-                                }
-                                rawComponent.contains("audio") || rawComponent.contains("sound") || rawComponent.contains("video") || rawComponent.contains("media") -> {
-                                    SubsystemInfo("audio", -7, "audio", getString(R.string.battery_insight_subsystem_audio))
-                                }
-                                else -> SubsystemInfo("", 0, "", "")
-                            }
-
-                            if (sub.key.isNotEmpty()) {
-                                val existing = resultMap[sub.key]
-                                if (existing != null) {
-                                    existing.consumedPowerMah = maxOf(existing.consumedPowerMah, power)
-                                    if (durationMs > 0) existing.foregroundTimeMs = maxOf(existing.foregroundTimeMs, durationMs)
-                                } else {
-                                    resultMap[sub.key] = BatteryInsightAppUsage().apply {
-                                        this.uid = sub.uid
-                                        this.packageName = sub.pkg
-                                        this.appLabel = sub.label
-                                        this.consumedPowerMah = power
-                                        this.foregroundTimeMs = if (sub.key == "screen" && durationMs <= 0) mCurrentStats.screenOnTime else durationMs
-                                        this.backgroundTimeMs = if (sub.key == "idle" && durationMs <= 0) mCurrentStats.screenOffTime else 0L
-                                    }
-                                }
-                            }
-                        }
-                        continue
-                    }
-
-                    // 2. Check UID Items (supports u0a123, u0_a123, u999a123, direct integer UIDs 10264, etc.)
-                    val match = uidPattern.find(line)
-                    if (match != null) {
-                        val uNormal = match.groupValues[1]
-                        val aNormal = match.groupValues[2]
-                        val uIsolated = match.groupValues[3]
-                        val aIsolated = match.groupValues[4]
-                        val directUid = match.groupValues[5]
-                        val powerStr = match.groupValues[6]
-
-                        val realUid = when {
-                            uNormal.isNotEmpty() && aNormal.isNotEmpty() -> {
-                                val u = uNormal.toIntOrNull() ?: 0
-                                val a = aNormal.toIntOrNull() ?: continue
-                                (u * 100000) + 10000 + a
-                            }
-                            uIsolated.isNotEmpty() && aIsolated.isNotEmpty() -> {
-                                val u = uIsolated.toIntOrNull() ?: 0
-                                val a = aIsolated.toIntOrNull() ?: continue
-                                (u * 100000) + 99000 + a
-                            }
-                            directUid.isNotEmpty() -> {
-                                directUid.toIntOrNull() ?: continue
-                            }
-                            else -> continue
-                        }
-
-                        var power = powerStr.toDoubleOrNull() ?: continue
-                        if (power < 0.05) continue
-
-                        if (power > batteryCapacityLimit) {
-                            power = power.coerceAtMost(batteryCapacityLimit * 0.5)
-                        }
-
-                        // Extract screen / foreground time from parentheses across OEM styles
-                        var appFgDurationMs = 0L
-                        val screenTimeMatch = Regex("""screen=[\d.]+\s*\(([^)]+)\)""").find(line)
-                        if (screenTimeMatch != null) {
-                            appFgDurationMs = parseDurationMs(screenTimeMatch.groupValues[1])
-                        } else {
-                            val cpuFgMatch = Regex("""cpu:fg=[\d.]+\s*\(([^)]+)\)""").find(line)
-                            if (cpuFgMatch != null) {
-                                appFgDurationMs = parseDurationMs(cpuFgMatch.groupValues[1])
-                            } else {
-                                val fgGenericMatch = Regex("""fg=[\d.]+\s*\(([^)]+)\)""").find(line)
-                                if (fgGenericMatch != null) {
-                                    appFgDurationMs = parseDurationMs(fgGenericMatch.groupValues[1])
-                                }
-                            }
-                        }
-
-                        var (pkgName, label) = when (realUid) {
-                            0 -> Pair("kernel", getString(R.string.battery_insight_process_kernel))
-                            1000 -> Pair("android", getString(R.string.battery_insight_process_android))
-                            1001, 1073 -> Pair("com.android.phone", getString(R.string.battery_insight_process_phone))
-                            1041 -> Pair("audioserver", getString(R.string.battery_insight_process_audio))
-                            1047 -> Pair("cameraserver", getString(R.string.battery_insight_process_camera))
-                            1036 -> Pair("webview", "Android WebView")
-                            else -> appMap[realUid] ?: Pair("", "")
-                        }
-
-                        if (pkgName.isEmpty()) {
-                            val pkgs = try { pm.getPackagesForUid(realUid) } catch (_: Exception) { null }
-                            pkgName = pkgs?.firstOrNull() ?: ""
-                            if (pkgName.isEmpty()) {
-                                pkgName = "uid.$realUid"
-                                label = "UID $realUid"
-                            } else {
-                                label = try {
-                                    val ai = pm.getApplicationInfo(pkgName, 0)
-                                    pm.getApplicationLabel(ai).toString()
-                                } catch (_: Exception) {
-                                    pkgName
-                                }
-                            }
-                            appMap[realUid] = Pair(pkgName, label)
-                        }
-
-                        if (appFgDurationMs <= 0L) {
-                            appFgDurationMs = fgTimeMap[pkgName] ?: 0L
-                        }
-
-                        val appKey = if (pkgName.isNotEmpty() && !pkgName.startsWith("uid.")) pkgName else "uid_$realUid"
-                        val existing = resultMap[appKey]
-                        if (existing != null) {
-                            existing.consumedPowerMah = maxOf(existing.consumedPowerMah, power)
-                            if (appFgDurationMs > 0) existing.foregroundTimeMs = maxOf(existing.foregroundTimeMs, appFgDurationMs)
-                        } else {
-                            resultMap[appKey] = BatteryInsightAppUsage().apply {
-                                this.uid = realUid
-                                this.packageName = pkgName
-                                this.appLabel = label
-                                this.consumedPowerMah = power
-                                this.foregroundTimeMs = appFgDurationMs
-                                this.backgroundTimeMs = 0L
-                            }
-                        }
+                val fgMs = if (entry.foregroundMs > 0L) entry.foregroundMs else fgTimeMap[pkgName] ?: 0L
+                val appKey = if (pkgName.isNotEmpty() && !pkgName.startsWith("uid.")) pkgName else "uid_$realUid"
+                val existing = resultMap[appKey]
+                if (existing != null) {
+                    existing.consumedPowerMah = maxOf(existing.consumedPowerMah, entry.powerMah)
+                    if (fgMs > 0) existing.foregroundTimeMs = maxOf(existing.foregroundTimeMs, fgMs)
+                } else {
+                    resultMap[appKey] = BatteryInsightAppUsage().apply {
+                        this.uid = realUid
+                        this.packageName = pkgName
+                        this.appLabel = label
+                        this.consumedPowerMah = entry.powerMah
+                        this.foregroundTimeMs = fgMs
+                        this.backgroundTimeMs = 0L
                     }
                 }
             }
@@ -1532,7 +1450,8 @@ class BatteryInsightService : Service() {
             // Fallback to UsageStats if no dumpsys data is available
             if (result.isEmpty() && fgTimeMap.isNotEmpty()) {
                 val totalFgTime = fgTimeMap.values.sum().coerceAtLeast(1L)
-                val estimatedTotalDrain = (mCurrentStats.batteryDrainScreenOn.toDouble() * (mCurrentStats.totalCapacity / 100.0)).coerceAtLeast(10.0)
+                val drainOn = synchronized(mCurrentStats) { mCurrentStats.batteryDrainScreenOn }
+                val estimatedTotalDrain = (drainOn.toDouble() * (totalCapacity / 100.0)).coerceAtLeast(10.0)
 
                 for ((pkg, fgMs) in fgTimeMap) {
                     if (fgMs < 10000L) continue
@@ -1564,82 +1483,110 @@ class BatteryInsightService : Service() {
         } catch (_: Exception) {}
     }
 
-    private var lastZeroCurrentNotifiedTime = 0L
+    // endregion
 
-    private fun checkAlarms(level: Int, charging: Boolean) {
-        val now = System.currentTimeMillis()
+    // region Alarms
 
-        // 1. Sıfır Akım Tam Şarj Bildirimi (Zero Current Full Charge Alarm)
-        // Telefon KESİNLİKLE %100 olduktan sonra VE sürekli (en az 10 saniye/ölçüm) sıfır akıma (<= 5 mA) inmedikçe bildirim atma!
-        // level < 100 iken cihaz/OEM BATTERY_STATUS_FULL raporlasa bile (termal duraklama, pil koruma limiti vb.) ASLA tam şarj bildirimi atılmaz!
-        if (mCurrentStats.isZeroCurrentAlarmEnabled && (charging || isPlugged) && level >= 100) {
-            val currentNowAbs = abs(mCurrentStats.currentNow)
-            if (currentNowAbs <= 5) {
-                zeroCurrentSustainCount++
-                if (zeroCurrentSustainCount >= 10) {
-                    if (now - lastZeroCurrentNotifiedTime >= 120000) {
-                        triggerAlarm(
-                            getString(R.string.battery_insight_alarm_zero_current_title, level),
-                            getString(R.string.battery_insight_alarm_zero_current_desc)
-                        )
-                        lastZeroCurrentNotifiedTime = now
-                    }
-                }
-            } else {
-                zeroCurrentSustainCount = 0
-            }
+    private fun checkAlarmsLocked(now: Long) {
+        val s = mCurrentStats
+        val level = s.level
+        if (!BatteryLevelValidator.isValid(level)) return
+        val plugged = isPlugged || isCharging
+        val frequency = s.alarmFrequency
+
+        // 1. Zero-current full charge: only at a real 100% with the current sustained at ~0 mA.
+        // OEMs may report BATTERY_STATUS_FULL below 100% (thermal pause, charge limit); ignored.
+        if (!(s.isZeroCurrentAlarmEnabled && plugged)) {
+            zeroCurrentSinceMs = 0L
+            zeroCurrentAlarm.reset()
         } else {
-            zeroCurrentSustainCount = 0
+            val zeroNow = level >= 100 && abs(s.currentNow) <= ZERO_CURRENT_MAX_MA
+            if (!zeroNow) {
+                zeroCurrentSinceMs = 0L
+            } else {
+                if (zeroCurrentSinceMs == 0L) zeroCurrentSinceMs = now
+                if (now - zeroCurrentSinceMs >= ZERO_CURRENT_SUSTAIN_MS &&
+                    zeroCurrentAlarm.shouldFire(true, level, now, frequency, AlarmTracker.Direction.NONE)
+                ) {
+                    triggerAlarm(
+                        getString(R.string.battery_insight_alarm_zero_current_title, level),
+                        getString(R.string.battery_insight_alarm_zero_current_desc)
+                    )
+                }
+            }
         }
 
-        // 2. Eşik Seviyesi Alarmları
-        if (!mCurrentStats.isBatteryAlarmEnabled) return
-        if (now - lastAlarmNotifiedTime < 60000 && lastAlarmNotifiedLevel == level) return
-
-        if (!charging && level <= mCurrentStats.batteryLowThreshold) {
-            triggerAlarm(
-                getString(R.string.battery_insight_alarm_low_title, level),
-                getString(R.string.battery_insight_alarm_low_desc)
-            )
-            lastAlarmNotifiedLevel = level
-            lastAlarmNotifiedTime = now
-        } else if (charging && level >= mCurrentStats.batteryHighThreshold && level < 100) {
-            triggerAlarm(
-                getString(R.string.battery_insight_alarm_limit_title, level),
-                getString(R.string.battery_insight_alarm_limit_desc)
-            )
-            lastAlarmNotifiedLevel = level
-            lastAlarmNotifiedTime = now
-        } else if (mCurrentStats.isFullChargeAlarmEnabled && level >= 100) {
+        // 2. Full charge (independent of the threshold alarm switch, as shown in the settings UI).
+        if (!(s.isFullChargeAlarmEnabled && plugged)) {
+            fullAlarm.reset()
+        } else if (level >= 100 &&
+            fullAlarm.shouldFire(true, level, now, frequency, AlarmTracker.Direction.NONE)
+        ) {
             triggerAlarm(
                 getString(R.string.battery_insight_alarm_full_title),
                 getString(R.string.battery_insight_alarm_full_desc)
             )
-            lastAlarmNotifiedLevel = level
-            lastAlarmNotifiedTime = now
+        }
+
+        // 3. Threshold alarms
+        if (!s.isBatteryAlarmEnabled) {
+            lowAlarm.reset()
+            highAlarm.reset()
+            return
+        }
+        if (lowAlarm.shouldFire(!plugged && level <= s.batteryLowThreshold, level, now, frequency, AlarmTracker.Direction.FALLING)) {
+            triggerAlarm(
+                getString(R.string.battery_insight_alarm_low_title, level),
+                getString(R.string.battery_insight_alarm_low_desc)
+            )
+        }
+        if (highAlarm.shouldFire(plugged && level >= s.batteryHighThreshold, level, now, frequency, AlarmTracker.Direction.RISING)) {
+            // At 100% the full-charge alarm (if enabled) is the more specific message.
+            if (!(level >= 100 && s.isFullChargeAlarmEnabled)) {
+                triggerAlarm(
+                    getString(R.string.battery_insight_alarm_limit_title, level),
+                    getString(R.string.battery_insight_alarm_limit_desc)
+                )
+            }
         }
     }
 
     private fun triggerAlarm(title: String, text: String) {
-        if (mCurrentStats.isBatteryAlarmVibrate) {
-            vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 350, 200, 350), -1))
+        val audio = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val ringerMode = audio?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
+
+        if (mCurrentStats.isBatteryAlarmVibrate && ringerMode != AudioManager.RINGER_MODE_SILENT) {
+            try {
+                vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 350, 200, 350), -1))
+            } catch (_: Exception) {}
         }
-        val soundUriStr = mCurrentStats.batteryAlarmSound
-        val soundUri = if (!soundUriStr.isNullOrEmpty()) Uri.parse(soundUriStr) else RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        try {
-            val r = RingtoneManager.getRingtone(this, soundUri)
-            r.play()
-        } catch (_: Exception) {}
+        if (ringerMode == AudioManager.RINGER_MODE_NORMAL) {
+            val soundUriStr = mCurrentStats.batteryAlarmSound
+            val soundUri = if (!soundUriStr.isNullOrEmpty()) Uri.parse(soundUriStr) else RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            try {
+                activeRingtone?.stop()
+                activeRingtone = RingtoneManager.getRingtone(this, soundUri)?.apply {
+                    audioAttributes = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                    play()
+                }
+            } catch (_: Exception) {}
+        }
 
         val notif = NotificationCompat.Builder(this, ALARM_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_battery_insight_notify)
             .setContentTitle(title)
             .setContentText(text)
+            .setContentIntent(contentPendingIntent())
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .build()
         notifManager.notify(ALARM_NOTIF_ID, notif)
     }
+
+    // endregion
 
     fun resetStatsInternal(reason: String) {
         Log.i(TAG, "Resetting statistics: $reason")
@@ -1663,8 +1610,7 @@ class BatteryInsightService : Service() {
             accumChargeScreenOffMs = 0L
             chargeCurrentSum = 0L
             chargeSampleCount = 0
-            zeroCurrentSustainCount = 0
-            lastZeroCurrentNotifiedTime = 0L
+            zeroCurrentSinceMs = 0L
 
             minCurrent = Int.MAX_VALUE
             maxCurrent = Int.MIN_VALUE
@@ -1673,28 +1619,23 @@ class BatteryInsightService : Service() {
 
             bucketStartDrain = 0
             bucketStartScreenOnMs = 0L
+            bucketMinCurrent = Int.MAX_VALUE
+            bucketMaxCurrent = Int.MIN_VALUE
+            bucketCurrentSum = 0L
+            bucketSampleCount = 0
 
             mFlowSamples.clear()
             mHistoryBuckets.clear()
             mAppUsages.clear()
+            lastAppUsageFetchMs = 0L
 
             saveSessionState()
         }
+        // Persist the cleared buffers, otherwise a restart would restore the pre-reset data.
+        saveArchives(includeLastSessions = false)
     }
 
-    private fun formatDuration(ms: Long): String {
-        val totalSec = ms / 1000
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return if (h > 0) {
-            getString(R.string.battery_insight_duration_h_m, h, m)
-        } else if (m > 0) {
-            getString(R.string.battery_insight_duration_m_s, m, s)
-        } else {
-            getString(R.string.battery_insight_duration_s, s)
-        }
-    }
+    // region Notification
 
     /**
      * Notification-specific duration format:
@@ -1708,8 +1649,7 @@ class BatteryInsightService : Service() {
         if (ms <= 0L) {
             return getString(R.string.battery_insight_duration_m, 0)
         }
-        val totalSec = ms / 1000
-        val totalMin = totalSec / 60
+        val totalMin = ms / 1000 / 60
         val h = totalMin / 60
         val m = totalMin % 60
         return when {
@@ -1719,80 +1659,86 @@ class BatteryInsightService : Service() {
         }
     }
 
-    private fun createNotification(
-        titleOverride: String? = null,
-        summaryOverride: String? = null,
-        bodyOverride: String? = null
-    ): Notification {
-        val title: String
-        val summary: String
-        val body: String
+    private class NotificationContent(
+        val title: String,
+        val summary: String,
+        val body: String,
+        val iconStyle: Int,
+        val iconKey: String,
+        val stats: BatteryInsightStats,
+    )
 
-        if (titleOverride != null && summaryOverride != null && bodyOverride != null) {
-            title = titleOverride
-            summary = summaryOverride
-            body = bodyOverride
+    private fun buildNotificationContent(s: BatteryInsightStats): NotificationContent {
+        val isChargingState = s.isCharging || isPlugged
+        val mA = abs(s.currentNow)
+        val currentStr = when {
+            mA == 0 -> "0 mA"
+            s.currentNow > 0 -> "+$mA mA"
+            else -> "-$mA mA"
+        }
+        val statusStr = if (isChargingState) {
+            if (s.level >= 100) getString(R.string.battery_insight_notif_full) else getString(R.string.battery_insight_notif_charging)
         } else {
-            val s = synchronized(mCurrentStats) { mCurrentStats.copy() }
-            val isChargingState = s.isCharging || isPlugged
-            val mA = abs(s.currentNow)
-            val currentStr = if (isChargingState) {
-                if (mA > 0) "+$mA mA" else "0 mA"
-            } else {
-                if (mA > 0) "-$mA mA" else "0 mA"
-            }
-            val statusStr = if (isChargingState) {
-                if (s.level >= 100) getString(R.string.battery_insight_notif_full) else getString(R.string.battery_insight_notif_charging)
-            } else {
-                getString(R.string.battery_insight_notif_discharging)
-            }
+            getString(R.string.battery_insight_notif_discharging)
+        }
+        val tempStr = "%.1f".format(s.temp / 10f)
+        val powerWattsStr = "%.2f".format(s.powerWatts)
 
-            val tempStr = "%.1f".format(s.temp / 10f)
-            val powerWattsStr = "%.2f".format(s.powerWatts)
+        val title = "${s.level}% • $statusStr • $currentStr • ${tempStr}°C"
+        val summary = "${s.level}% • $currentStr • $powerWattsStr W"
 
-            title = "${s.level}% • $statusStr • $currentStr • ${tempStr}°C"
-            summary = "${s.level}% • $currentStr • $powerWattsStr W"
+        val totalScreenOff = s.screenOffTime
+        val hasSignificantScreenOff = totalScreenOff >= 60000L
+        val awakePct = if (hasSignificantScreenOff && s.awakeTime > 0L) {
+            ((s.awakeTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
+        } else 0f
+        val deepSleepPct = if (hasSignificantScreenOff && s.deepSleepTime > 0L) {
+            ((s.deepSleepTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
+        } else 0f
 
-            val totalScreenOff = s.screenOffTime
-            val hasSignificantScreenOff = totalScreenOff >= 60000L
+        val activeRateStr = if (s.screenOnTime >= 60000L && s.activeDrainRate > 0f) "%.1f".format(s.activeDrainRate) else "0.0"
+        val idleRateStr = if (s.screenOffTime >= 60000L && s.idleDrainRate > 0f) "%.1f".format(s.idleDrainRate) else "0.0"
 
-            val awakePct = if (hasSignificantScreenOff && s.awakeTime > 0L) {
-                ((s.awakeTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
-            } else {
-                0f
-            }
-            val deepSleepPct = if (hasSignificantScreenOff && s.deepSleepTime > 0L) {
-                ((s.deepSleepTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
-            } else {
-                0f
-            }
-
-            val activeRateStr = if (s.screenOnTime >= 60000L && s.activeDrainRate > 0f) "%.1f".format(s.activeDrainRate) else "0.0"
-            val idleRateStr = if (s.screenOffTime >= 60000L && s.idleDrainRate > 0f) "%.1f".format(s.idleDrainRate) else "0.0"
-            val awakePctStr = "%.1f".format(awakePct)
-            val deepSleepPctStr = "%.1f".format(deepSleepPct)
-
-            body = buildString {
-                append(getString(R.string.battery_insight_notif_active, activeRateStr))
-                append(" • ")
-                append(getString(R.string.battery_insight_notif_idle, idleRateStr))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_screen_on, formatDurationNotif(s.screenOnTime), s.batteryDrainScreenOn.toString()))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_screen_off, formatDurationNotif(s.screenOffTime), s.batteryDrainScreenOff.toString()))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), awakePctStr))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), deepSleepPctStr))
-            }
+        val body = buildString {
+            append(getString(R.string.battery_insight_notif_active, activeRateStr))
+            append(" • ")
+            append(getString(R.string.battery_insight_notif_idle, idleRateStr))
+            append("\n")
+            append(getString(R.string.battery_insight_notif_screen_on, formatDurationNotif(s.screenOnTime), s.batteryDrainScreenOn.toString()))
+            append("\n")
+            append(getString(R.string.battery_insight_notif_screen_off, formatDurationNotif(s.screenOffTime), s.batteryDrainScreenOff.toString()))
+            append("\n")
+            append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), "%.1f".format(awakePct)))
+            append("\n")
+            append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), "%.1f".format(deepSleepPct)))
         }
 
-        return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_battery_insight_notify)
-            .setContentTitle(title)
-            .setContentText(summary)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setContentIntent(contentPendingIntent)
+        val iconStyle = prefs.getInt(PREF_NOTIF_ICON_STYLE, StatusIconRenderer.STYLE_BATTERY)
+        val iconKey = "$iconStyle|" + statusIconRenderer.labelFor(iconStyle, s).joinToString("|") +
+            if (iconStyle == StatusIconRenderer.STYLE_CIRCLE_PERCENT) "|${s.level}" else ""
+        return NotificationContent(title, summary, body, iconStyle, iconKey, s)
+    }
+
+    private fun contentPendingIntent(): PendingIntent {
+        val launch = IconUtils.launchIntent(this)
+        val component = launch.component?.flattenToString()
+        val cached = cachedContentIntent
+        if (cached != null && component == cachedContentIntentComponent) return cached
+        return PendingIntent.getActivity(this, 0, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT).also {
+            cachedContentIntent = it
+            cachedContentIntentComponent = component
+        }
+    }
+
+    private fun createNotification(content: NotificationContent): Notification {
+        val builder = NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
+        val dynamicIcon: IconCompat? = statusIconRenderer.render(content.iconStyle, content.stats)
+        if (dynamicIcon != null) builder.setSmallIcon(dynamicIcon) else builder.setSmallIcon(R.drawable.ic_battery_insight_notify)
+        return builder
+            .setContentTitle(content.title)
+            .setContentText(content.summary)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content.body))
+            .setContentIntent(contentPendingIntent())
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -1806,67 +1752,31 @@ class BatteryInsightService : Service() {
             .build()
     }
 
+    private fun forceNotificationUpdate() {
+        scope.launch(stateDispatcher) {
+            lastNotifTitle = ""
+            updateNotification()
+        }
+    }
+
     private fun updateNotification() {
         if (!prefs.getBoolean("battery_insight_enabled", true) || !prefs.getBoolean("battery_insight_notif_enabled", true)) {
             return
         }
         try {
-            val s = synchronized(mCurrentStats) { mCurrentStats.copy() }
-            val isChargingState = s.isCharging || isPlugged
-            val mA = abs(s.currentNow)
-            val currentStr = if (isChargingState) {
-                if (mA > 0) "+$mA mA" else "0 mA"
-            } else {
-                if (mA > 0) "-$mA mA" else "0 mA"
-            }
-            val statusStr = if (isChargingState) {
-                if (s.level >= 100) getString(R.string.battery_insight_notif_full) else getString(R.string.battery_insight_notif_charging)
-            } else {
-                getString(R.string.battery_insight_notif_discharging)
-            }
-            val tempStr = "%.1f".format(s.temp / 10f)
-            val powerWattsStr = "%.2f".format(s.powerWatts)
-            val newTitle = "${s.level}% • $statusStr • $currentStr • ${tempStr}°C"
-            val newSummary = "${s.level}% • $currentStr • $powerWattsStr W"
-
-            val activeRateStr = if (s.screenOnTime >= 60000L && s.activeDrainRate > 0f) "%.1f".format(s.activeDrainRate) else "0.0"
-            val idleRateStr = if (s.screenOffTime >= 60000L && s.idleDrainRate > 0f) "%.1f".format(s.idleDrainRate) else "0.0"
-            val totalScreenOff = s.screenOffTime
-            val hasSignificantScreenOff = totalScreenOff >= 60000L
-
-            val awakePct = if (hasSignificantScreenOff && s.awakeTime > 0L) {
-                ((s.awakeTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
-            } else 0f
-            val deepSleepPct = if (hasSignificantScreenOff && s.deepSleepTime > 0L) {
-                ((s.deepSleepTime.toFloat() / totalScreenOff.toFloat()) * 100f).coerceIn(0f, 100f)
-            } else 0f
-            val awakePctStr = "%.1f".format(awakePct)
-            val deepSleepPctStr = "%.1f".format(deepSleepPct)
-
-            val newBody = buildString {
-                append(getString(R.string.battery_insight_notif_active, activeRateStr))
-                append(" • ")
-                append(getString(R.string.battery_insight_notif_idle, idleRateStr))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_screen_on, formatDurationNotif(s.screenOnTime), s.batteryDrainScreenOn.toString()))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_screen_off, formatDurationNotif(s.screenOffTime), s.batteryDrainScreenOff.toString()))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_awake, formatDurationNotif(s.awakeTime), awakePctStr))
-                append("\n")
-                append(getString(R.string.battery_insight_notif_deep_sleep, formatDurationNotif(s.deepSleepTime), deepSleepPctStr))
-            }
-
-            // Real-time updates: update immediately when any value changes (mA, watts, level, temp, etc.)
-            val textChanged = newTitle != lastNotifTitle || newSummary != lastNotifSummary || newBody != lastNotifBody
-            if (!textChanged) {
+            val content = buildNotificationContent(snapshotStats())
+            // Real-time updates: update immediately when any value changes (mA, watts, level, temp, icon)
+            val changed = content.title != lastNotifTitle || content.summary != lastNotifSummary ||
+                content.body != lastNotifBody || content.iconKey != lastNotifIconKey
+            if (!changed) {
                 return // Skip redundant IPC if absolutely nothing changed
             }
 
-            lastNotifTitle = newTitle
-            lastNotifSummary = newSummary
-            lastNotifBody = newBody
-            notifManager.notify(NOTIF_ID, createNotification(newTitle, newSummary, newBody))
+            lastNotifTitle = content.title
+            lastNotifSummary = content.summary
+            lastNotifBody = content.body
+            lastNotifIconKey = content.iconKey
+            notifManager.notify(NOTIF_ID, createNotification(content))
         } catch (e: Exception) {
             Log.e(TAG, "Error updating notification", e)
         }
@@ -1879,6 +1789,7 @@ class BatteryInsightService : Service() {
                 notifManager.deleteNotificationChannel("battery_insight_channel")
                 notifManager.deleteNotificationChannel("battery_insight_monitor_silent_v2")
                 notifManager.deleteNotificationChannel("battery_insight_monitor_silent_v3")
+                notifManager.deleteNotificationChannel("battery_insight_alarm_channel")
             } catch (_: Exception) {}
 
             val monitorChannel = NotificationChannel(
@@ -1899,6 +1810,9 @@ class BatteryInsightService : Service() {
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = getString(R.string.battery_insight_alarm_channel_desc)
+                // The alarm sound and vibration pattern chosen in the app are played by triggerAlarm().
+                setSound(null, null)
+                enableVibration(false)
             }
 
             notifManager.createNotificationChannel(monitorChannel)
@@ -1906,27 +1820,33 @@ class BatteryInsightService : Service() {
         } catch (_: Exception) {}
     }
 
+    // endregion
+
     override fun onDestroy() {
         instance = null
+        monitorJob?.cancel()
         try {
-            saveSessionState()
             unregisterReceiver(batteryReceiver)
         } catch (_: Exception) {}
+        try {
+            val snapshot = synchronized(mCurrentStats) {
+                saveSessionState()
+                ArchiveSnapshot.take(this, includeLast = false)
+            }
+            snapshot.writeTo(storage)
+        } catch (_: Exception) {}
+        try {
+            activeRingtone?.stop()
+        } catch (_: Exception) {}
+
+        scope.cancel()
+        stateDispatcher.close()
 
         // If destroyed unexpectedly, arm revive alarm
         if (prefs.getBoolean("battery_insight_enabled", true)) {
             try {
                 val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
-                val intent = Intent(this, BootReceiver::class.java).apply {
-                    action = "com.acer.batteryinsight.WATCHDOG_KEEPALIVE"
-                }
-                val pendingIntent = PendingIntent.getBroadcast(
-                    this,
-                    9999,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                alarmManager?.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000L, pendingIntent)
+                alarmManager?.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000L, watchdogPendingIntent())
             } catch (_: Exception) {}
         }
         super.onDestroy()

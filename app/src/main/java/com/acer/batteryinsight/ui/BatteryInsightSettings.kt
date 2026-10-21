@@ -94,6 +94,7 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
     val updateInfo by viewModel.updateInfo.collectAsState()
     val updateDownloadState by viewModel.updateDownloadState.collectAsState()
     val updateSnackMessage by viewModel.updateSnackMessage.collectAsState()
+    val liquidGlass by viewModel.liquidGlass.collectAsState()
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var showHealthDetails by remember { mutableStateOf(false) }
@@ -346,6 +347,11 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
                             allAppsSum.coerceIn(1.0, batteryCap.toDouble())
                         }
                     }
+                    // Per-app shares use the same time base as the per-app values (batterystats
+                    // "since charged"), not the app's own session drain.
+                    val measuredTotalMah = remember(apps) {
+                        apps.sumOf { it.consumedPowerMah }.coerceAtLeast(1.0)
+                    }
 
                     LazyColumn(
                         state = appsScrollState,
@@ -426,7 +432,7 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
                                 items = filteredApps,
                                 key = { index, app -> "${app.uid}_${app.packageName}_$index" },
                             ) { _, app ->
-                                val pct = (app.consumedPowerMah * 100.0 / totalDischargedMah).coerceIn(0.0, 100.0)
+                                val pct = (app.consumedPowerMah * 100.0 / measuredTotalMah).coerceIn(0.0, 100.0)
                                 AppUsageRow(
                                     app = app,
                                     pct = pct,
@@ -497,11 +503,12 @@ fun BatteryInsightRoot(viewModel: BatteryInsightViewModel = viewModel()) {
         AppBottomNavBar(
             selectedTab = selectedTab,
             onTabSelected = { selectedTab = it },
-            isFloating = true,
-            isBlurEnabled = true,
+            isFloating = liquidGlass,
+            isBlurEnabled = liquidGlass,
+            // The standard NavigationBar applies the navigation bar inset itself.
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = bottomInset + 12.dp),
+                .then(if (liquidGlass) Modifier.padding(bottom = bottomInset + 12.dp) else Modifier),
         )
 
             if (showHealthDetails) {

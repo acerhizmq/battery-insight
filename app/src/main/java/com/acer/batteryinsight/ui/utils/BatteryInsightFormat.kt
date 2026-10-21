@@ -58,3 +58,26 @@ fun BatteryInsightStats.isFullyCharged(): Boolean {
     return status == android.os.BatteryManager.BATTERY_STATUS_FULL
         || status == android.os.BatteryManager.BATTERY_STATUS_NOT_CHARGING
 }
+
+/** Labels in the order of StatusIconRenderer.STYLE_* constants. */
+fun notificationIconStyleLabels(context: Context): List<String> = listOf(
+    context.getString(R.string.battery_insight_icon_battery),
+    context.getString(R.string.battery_insight_icon_percent),
+    context.getString(R.string.battery_insight_icon_circle_percent),
+    context.getString(R.string.battery_insight_icon_temp),
+    context.getString(R.string.battery_insight_icon_percent_temp),
+    context.getString(R.string.battery_insight_icon_current),
+    context.getString(R.string.battery_insight_icon_voltage),
+    context.getString(R.string.battery_insight_icon_power),
+)
+
+/** Maps the service's English health keys to a localized label. */
+fun localizedHealth(context: Context, health: String?): String = when (health) {
+    "Good" -> context.getString(R.string.battery_insight_health_good)
+    "Overheat" -> context.getString(R.string.battery_insight_health_overheat)
+    "Dead" -> context.getString(R.string.battery_insight_health_dead)
+    "Over Voltage" -> context.getString(R.string.battery_insight_health_over_voltage)
+    "Cold" -> context.getString(R.string.battery_insight_health_cold)
+    "Failure" -> context.getString(R.string.battery_insight_health_failure)
+    else -> context.getString(R.string.battery_insight_unknown)
+}

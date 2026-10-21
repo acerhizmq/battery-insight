@@ -13,6 +13,7 @@ import com.acer.batteryinsight.model.BatteryInsightAppUsage
 import com.acer.batteryinsight.model.BatteryInsightFlowSample
 import com.acer.batteryinsight.model.BatteryInsightHistoryBucket
 import com.acer.batteryinsight.model.BatteryInsightStats
+import com.acer.batteryinsight.service.BatteryLevelValidator
 import com.acer.batteryinsight.service.IBatteryInsightService
 import com.acer.batteryinsight.ui.components.UpdateDownloadState
 import com.acer.batteryinsight.updater.AppUpdateInfo
@@ -29,6 +30,9 @@ import java.io.File
 class BatteryInsightViewModel : ViewModel() {
     companion object {
         private const val TAG = "BatteryInsightVM"
+        const val PREF_AMOLED = "battery_insight_amoled_mode"
+        const val PREF_DYNAMIC_COLOR = "battery_insight_dynamic_color"
+        const val PREF_LIQUID_GLASS = "battery_insight_liquid_glass"
     }
 
     private var service: IBatteryInsightService? = null
@@ -45,8 +49,16 @@ class BatteryInsightViewModel : ViewModel() {
                 val rawLevel = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
                 val rawScale = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
                 val pct = if (rawLevel >= 0 && rawScale > 0) ((rawLevel * 100) / rawScale) else -1
-                val validLevel = if (pct in 1..100) pct else (bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1)
-                val finalLevel = if (validLevel in 1..100) validLevel else 100
+                val bmLevel = try {
+                    bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+                } catch (_: Exception) {
+                    -1
+                }
+                val savedLevel = ctx.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE)
+                    .getInt("last_battery_level", -1)
+                // Cross-check the sticky broadcast so a transient bogus value (e.g. 1%) is not shown.
+                val validLevel = BatteryLevelValidator.resolveSnapshot(pct, listOf(bmLevel), savedLevel)
+                val finalLevel = if (BatteryLevelValidator.isValid(validLevel)) validLevel else 100
                 stats.level = finalLevel
                 lastValidLevel = finalLevel
                 stats.isCharging = sticky?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) == android.os.BatteryManager.BATTERY_STATUS_CHARGING
@@ -144,6 +156,53 @@ class BatteryInsightViewModel : ViewModel() {
 
     private val _updateSnackMessage = MutableStateFlow<String?>(null)
     val updateSnackMessage: StateFlow<String?> = _updateSnackMessage.asStateFlow()
+
+    // --- Appearance & notification icon (UI-side preferences) ---
+    private val uiPrefs = com.acer.batteryinsight.BatteryInsightApp.instance
+        ?.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE)
+
+    private val _amoledMode = MutableStateFlow(uiPrefs?.getBoolean(PREF_AMOLED, false) ?: false)
+    val amoledMode: StateFlow<Boolean> = _amoledMode.asStateFlow()
+
+    private val _dynamicColor = MutableStateFlow(uiPrefs?.getBoolean(PREF_DYNAMIC_COLOR, true) ?: true)
+    val dynamicColor: StateFlow<Boolean> = _dynamicColor.asStateFlow()
+
+    private val _liquidGlass = MutableStateFlow(uiPrefs?.getBoolean(PREF_LIQUID_GLASS, true) ?: true)
+    val liquidGlass: StateFlow<Boolean> = _liquidGlass.asStateFlow()
+
+    private val _notifIconStyle = MutableStateFlow(
+        uiPrefs?.getInt(com.acer.batteryinsight.service.BatteryInsightService.PREF_NOTIF_ICON_STYLE, 0) ?: 0
+    )
+    val notifIconStyle: StateFlow<Int> = _notifIconStyle.asStateFlow()
+
+    fun setAmoledMode(v: Boolean) {
+        _amoledMode.value = v
+        uiPrefs?.edit()?.putBoolean(PREF_AMOLED, v)?.apply()
+    }
+
+    fun setDynamicColor(v: Boolean) {
+        _dynamicColor.value = v
+        uiPrefs?.edit()?.putBoolean(PREF_DYNAMIC_COLOR, v)?.apply()
+    }
+
+    fun setLiquidGlass(v: Boolean) {
+        _liquidGlass.value = v
+        uiPrefs?.edit()?.putBoolean(PREF_LIQUID_GLASS, v)?.apply()
+    }
+
+    fun setNotifIconStyle(v: Int) {
+        _notifIconStyle.value = v
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val s = connectService()
+                if (s != null) {
+                    s.setNotificationIconStyle(v)
+                } else {
+                    uiPrefs?.edit()?.putInt(com.acer.batteryinsight.service.BatteryInsightService.PREF_NOTIF_ICON_STYLE, v)?.apply()
+                }
+            } catch (_: Exception) {}
+        }
+    }
 
     private var hasLoadedSettings = false
 
@@ -270,22 +329,22 @@ class BatteryInsightViewModel : ViewModel() {
             }
             _isEnabled.value = s.isEnabled
 
-            // Realtime Flow: update every 2-3s
+            // Realtime Flow: every 2nd poll
             if (tick % 2 == 0) {
                 _flow.value = s.getCurrentFlow(30)?.toList() ?: emptyList()
             }
 
-            // Hourly History: update every 30s
+            // Hourly History: every 20th poll
             if (tick % 20 == 0 || _history.value.isEmpty()) {
                 _history.value = s.history?.toList() ?: emptyList()
             }
 
-            // App Usage: only update when empty or every 60 ticks (to avoid heavy dumpsys allocations while UI is active)
-            if (_apps.value.isEmpty() || tick % 60 == 0) {
+            // App Usage: cheap cached read; the service throttles the actual dumpsys run to every 2 min
+            if (_apps.value.isEmpty() || tick % 6 == 0) {
                 _apps.value = s.getAppUsageSinceLastCharge(40)?.toList() ?: emptyList()
             }
 
-            // Archived Session data: update every 15s or when empty
+            // Archived Session data: every 10th poll or when empty
             if (tick % 10 == 0 || _lastChargeFlow.value.isEmpty()) {
                 try {
                     _lastChargeFlow.value = s.getSessionFlow(1)?.toList() ?: emptyList()
@@ -554,6 +613,7 @@ class BatteryInsightViewModel : ViewModel() {
                 context = context,
                 downloadUrl = url,
                 versionName = info.latestVersion,
+                expectedSize = info.apkSize,
                 onProgress = { pct, down, total ->
                     _updateDownloadState.value = UpdateDownloadState.Downloading(pct, down, total)
                 }

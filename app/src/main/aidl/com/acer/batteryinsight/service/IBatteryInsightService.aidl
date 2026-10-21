@@ -25,6 +25,7 @@ interface IBatteryInsightService {
     
     boolean isNotificationEnabled();
     void setNotificationEnabled(boolean enabled);
+    void setNotificationIconStyle(int style);
 
     void setAutoResetLevel(int level);
     void setAutoResetLevelEnabled(boolean enabled);

@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import com.acer.batteryinsight.service.BatteryInsightService
-import com.topjohnwu.superuser.Shell
 
 class BatteryInsightApp : Application() {
 
@@ -25,13 +24,8 @@ class BatteryInsightApp : Application() {
             defaultHandler?.uncaughtException(thread, throwable)
         }
 
-        // Set up LibSU root shell builder
-        Shell.enableVerboseLogging = false
-        Shell.setDefaultBuilder(
-            Shell.Builder.create()
-                .setFlags(Shell.FLAG_MOUNT_MASTER)
-                .setTimeout(10)
-        )
+        // Set up LibSU root shell builder (must precede any shell creation)
+        com.acer.batteryinsight.utils.ShellUtils.configure()
 
         val prefs = getSharedPreferences("battery_insight_prefs", Context.MODE_PRIVATE)
         val isOnboardingCompleted = prefs.getBoolean("onboarding_completed", false)

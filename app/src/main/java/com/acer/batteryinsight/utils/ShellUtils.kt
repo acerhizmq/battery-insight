@@ -10,15 +10,22 @@ import androidx.core.content.ContextCompat
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import android.os.SystemClock
 import java.io.File
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 object ShellUtils {
 
     private const val TAG = "ShellUtils"
 
-    init {
-        // Configure LibSU shell flags
+    // Paths that root `cat` could not read either; retried after this delay instead of every tick.
+    private const val MISSING_PATH_RETRY_MS = 10 * 60 * 1000L
+    private val missingPaths = ConcurrentHashMap<String, Long>()
+
+    /** Configures LibSU; must run before the first shell is created (Application.onCreate). */
+    fun configure() {
         Shell.enableVerboseLogging = false
         Shell.setDefaultBuilder(
             Shell.Builder.create()
@@ -80,7 +87,7 @@ object ShellUtils {
         if (!isRootAvailable()) return@withContext null
 
         try {
-            val result = Shell.cmd("cat $path").exec()
+            val result = Shell.cmd("cat '$path' 2>/dev/null").exec()
             if (result.isSuccess && result.out.isNotEmpty()) {
                 result.out[0].trim()
             } else {
@@ -106,11 +113,17 @@ object ShellUtils {
             return null
         }
         if (!isRootAvailable()) return null
+        val missingSince = missingPaths[path]
+        if (missingSince != null && SystemClock.elapsedRealtime() - missingSince < MISSING_PATH_RETRY_MS) {
+            return null
+        }
         return try {
-            val result = Shell.cmd("cat $path").exec()
+            val result = Shell.cmd("cat '$path' 2>/dev/null").exec()
             if (result.isSuccess && result.out.isNotEmpty()) {
+                missingPaths.remove(path)
                 result.out[0].trim()
             } else {
+                missingPaths[path] = SystemClock.elapsedRealtime()
                 null
             }
         } catch (_: Exception) {
@@ -119,25 +132,40 @@ object ShellUtils {
     }
 
     /**
-     * Executes a command with timeout and non-blocking stream handling.
+     * Executes a shell command line (pipes and `||` are supported) through the root shell when
+     * available, otherwise through an unprivileged `sh -c` (enough for dumpsys once ADB granted DUMP).
      */
-    suspend fun exec(command: String, timeoutSec: Long = 5): List<String> = withContext(Dispatchers.IO) {
+    suspend fun exec(command: String, timeoutSec: Long = 15): List<String> = withContext(Dispatchers.IO) {
         if (isRootAvailable()) {
             try {
                 val result = Shell.cmd(command).exec()
-                if (result.isSuccess) return@withContext result.out
+                // A non-zero exit (e.g. grep found nothing) still carries useful output.
+                if (result.isSuccess || result.out.isNotEmpty()) return@withContext result.out
             } catch (e: Exception) {
                 Log.w(TAG, "Root exec failed: $command", e)
             }
         }
+        execUnprivileged(command, timeoutSec)
+    }
 
-        // Non-root fallback: run standard process for dumpsys if granted via ADB
+    /** Runs [command] only when root is granted; a no-op otherwise. */
+    suspend fun execRoot(command: String): List<String> = withContext(Dispatchers.IO) {
+        if (!isRootAvailable()) return@withContext emptyList()
         try {
-            val process = ProcessBuilder(*command.split("\\s+".toRegex()).toTypedArray())
+            Shell.cmd(command).exec().out
+        } catch (e: Exception) {
+            Log.w(TAG, "Root exec failed: $command", e)
+            emptyList()
+        }
+    }
+
+    private fun execUnprivileged(command: String, timeoutSec: Long): List<String> {
+        return try {
+            val process = ProcessBuilder("sh", "-c", command)
                 .redirectErrorStream(true)
                 .start()
 
-            val lines = mutableListOf<String>()
+            val lines = Collections.synchronizedList(mutableListOf<String>())
             val readerThread = Thread {
                 try {
                     process.inputStream.bufferedReader().forEachLine { lines.add(it) }
@@ -149,8 +177,8 @@ object ShellUtils {
             if (!finished) {
                 process.destroyForcibly()
             }
-            readerThread.join(500)
-            lines
+            readerThread.join(2000)
+            synchronized(lines) { ArrayList(lines) }
         } catch (e: Exception) {
             emptyList()
         }

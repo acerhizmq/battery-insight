@@ -1,5 +1,4 @@
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.util.Properties
 
 plugins {
@@ -28,25 +27,40 @@ fun bumpVersionName(current: String): String {
 var currentVersionCode = versionProps.getProperty("versionCode", "25").toInt()
 var currentVersionName = versionProps.getProperty("versionName", "1.3.0")
 
-val isBuildingApk = gradle.startParameter.taskNames.any { taskName ->
-    taskName.contains("assemble", ignoreCase = true) ||
-    taskName.contains("package", ignoreCase = true) ||
-    taskName.contains("build", ignoreCase = true)
+// Only release packaging bumps the version; debug builds, IDE syncs and helper tasks
+// (e.g. buildEnvironment) must not burn version numbers.
+val releaseTaskPattern = Regex("^(assemble|bundle|package)\\w*Release$", RegexOption.IGNORE_CASE)
+val isBuildingRelease = gradle.startParameter.taskNames.any { taskName ->
+    val name = taskName.substringAfterLast(':')
+    releaseTaskPattern.matches(name) || name in setOf("assemble", "bundle", "build")
 }
 
 val alreadyBumped = rootProject.extra.has("versionBumped")
-if (isBuildingApk && !alreadyBumped) {
+if (isBuildingRelease && !alreadyBumped) {
     currentVersionCode += 1
     currentVersionName = bumpVersionName(currentVersionName)
 
-    versionProps["versionCode"] = currentVersionCode.toString()
-    versionProps["versionName"] = currentVersionName
-    FileOutputStream(versionPropsFile).use {
-        versionProps.store(it, "Auto-incremented on build")
-    }
+    // Written by hand with LF line endings: Properties.store() uses the platform separator,
+    // which produced CRLF-only diffs between Windows and Linux checkouts.
+    versionPropsFile.writeText(
+        "#Auto-incremented on build\n" +
+            "versionName=$currentVersionName\n" +
+            "versionCode=$currentVersionCode\n"
+    )
     rootProject.extra.set("versionBumped", true)
     println("==> Auto-incremented Build Version: $currentVersionName (Code: $currentVersionCode)")
 }
+
+// Optional release signing: keystore.properties (git-ignored) or BI_* environment variables.
+// Without them, release builds fall back to the debug key as before.
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) FileInputStream(f).use { load(it) }
+}
+fun signingValue(key: String, env: String): String? =
+    keystoreProps.getProperty(key) ?: System.getenv(env)
+
+val releaseStoreFile = signingValue("storeFile", "BI_STORE_FILE")
 
 android {
     namespace = "com.acer.batteryinsight"
@@ -66,10 +80,26 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile)
+                storePassword = signingValue("storePassword", "BI_STORE_PASSWORD")
+                keyAlias = signingValue("keyAlias", "BI_KEY_ALIAS")
+                keyPassword = signingValue("keyPassword", "BI_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (releaseStoreFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                println("==> No release keystore configured; signing release with the debug key")
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -90,6 +120,9 @@ android {
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
+    }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
     packaging {
         resources {
@@ -144,8 +177,6 @@ dependencies {
 
     // LibSU (TopJohnWu - Official Magisk / KernelSU root library)
     implementation("com.github.topjohnwu.libsu:core:5.2.2")
-    implementation("com.github.topjohnwu.libsu:service:5.2.2")
 
-    // Gson for state persistence
-    implementation("com.google.code.gson:gson:2.10.1")
+    testImplementation("junit:junit:4.13.2")
 }

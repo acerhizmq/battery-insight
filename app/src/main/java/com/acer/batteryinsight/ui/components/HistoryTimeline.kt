@@ -65,9 +65,10 @@ fun HistoryTimelineItem(
 ) {
     val drainColor = Color(0xFFE57373)
     val lineColor = MaterialTheme.colorScheme.outlineVariant
-    val hourlyDrain = if (bucket.hourlyDrainPercent > 0) bucket.hourlyDrainPercent else bucket.drainPercent
+    // An hour without drain must show 0, not the cumulative session total.
+    val hourlyDrain = bucket.hourlyDrainPercent
     val drainFraction = (hourlyDrain / 15f).coerceIn(0f, 1f)
-    val sotTime = if (bucket.hourlyScreenOnMs > 0L) bucket.hourlyScreenOnMs else bucket.screenOnMs
+    val sotTime = bucket.hourlyScreenOnMs
 
     val isDark = MaterialTheme.colorScheme.surface.let {
         (it.red * 0.299 + it.green * 0.587 + it.blue * 0.114) < 0.5

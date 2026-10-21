@@ -5,6 +5,9 @@
 
 package com.acer.batteryinsight.ui.components
 
+import com.acer.batteryinsight.ui.utils.localizedHealth
+import androidx.compose.ui.platform.LocalContext
+
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -401,7 +404,7 @@ fun SessionDetailsContent(
                                              icon = Icons.Rounded.DeviceThermostat,
                                              label = stringResource(R.string.battery_insight_temp),
                                              duration = tempStr,
-                                             subtext = stats.health ?: "Good",
+                                             subtext = localizedHealth(LocalContext.current, stats.health),
                                              iconTint = Color(0xFFFFB74D),
                                              modifier = Modifier.weight(1f),
                                          )

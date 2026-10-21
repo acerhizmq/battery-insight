@@ -15,6 +15,11 @@ app/build/
 # Local SDK and environment properties (contains machine-specific paths)
 local.properties
 
+# Release signing secrets
+keystore.properties
+*.jks
+*.keystore
+
 # Android Studio / IntelliJ IDEA workspace files
 .idea/
 *.iml

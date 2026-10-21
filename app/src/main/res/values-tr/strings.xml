@@ -70,16 +70,16 @@
     <string name="battery_insight_battery_alarm_summary">Belirli eşiklere ulaşıldığında zamanında bildirim almak için pil seviyesi uyarılarını etkinleştir.</string>
     <string name="battery_insight_alarm_frequency">Alarm sıklığı</string>
     <string name="battery_insight_alarm_freq_once">Yalnızca bir kez</string>
-    <string name="battery_insight_alarm_freq_1pct">Her 1%% değişimde</string>
-    <string name="battery_insight_alarm_freq_5pct">Her 5%% değişimde</string>
-    <string name="battery_insight_alarm_freq_10pct">Her 10%% değişimde</string>
+    <string name="battery_insight_alarm_freq_1pct" formatted="false">Her 1% değişimde</string>
+    <string name="battery_insight_alarm_freq_5pct" formatted="false">Her 5% değişimde</string>
+    <string name="battery_insight_alarm_freq_10pct" formatted="false">Her 10% değişimde</string>
     <string name="battery_insight_alarm_freq_5min">Her 5 dakikada</string>
     <string name="battery_insight_alarm_freq_unknown">Bilinmeyen</string>
     <string name="battery_insight_alarm_sound">Alarm sesi</string>
     <string name="battery_insight_alarm_vibrate">Titreşim çal</string>
     <string name="battery_insight_alarm_vibrate_summary">Alarm çaldığında uzun titreşim deseni oynat.</string>
     <string name="battery_insight_full_charge_alarm">Tam şarjda bildir</string>
-    <string name="battery_insight_full_charge_alarm_summary">Pil tam şarj olduğunda bildirim al. Cihazlar genelde %%100\'e ulaştıktan 30 dk - 1 saat sonra tam şarj olur.</string>
+    <string name="battery_insight_full_charge_alarm_summary" formatted="false">Pil tam şarj olduğunda bildirim al. Cihazlar genelde %100\'e ulaştıktan 30 dk - 1 saat sonra tam şarj olur.</string>
     <string name="battery_insight_reset_dialog_title">İstatistikler sıfırlansın mı?</string>
     <string name="battery_insight_reset_dialog_message">Bu işlem izlenen tüm pil kullanımı ve akış verilerini temizler.</string>
     <string name="battery_insight_reset_confirm">Tüm pil istatistiklerini sıfırlamak istediğinizden emin misiniz?</string>
@@ -108,7 +108,7 @@
     <string name="battery_insight_capacity_ratio">%1$d/%2$d mAh</string>
     <string name="battery_insight_usable">Kullanılabilir</string>
     <string name="battery_insight_degraded_capacity">Kayıp / Aşınma</string>
-    <string name="battery_insight_optimal_capacity">%100 Sağlık (Kayıp yok)</string>
+    <string name="battery_insight_optimal_capacity" formatted="false">%100 Sağlık (Kayıp yok)</string>
     <string name="battery_insight_hourly_drain">Bu Saatte: -%%%1$d</string>
     <string name="battery_insight_total_session_drain">Toplam: -%%%1$d</string>
     <string name="battery_insight_percent_value">%1$d%%</string>
@@ -205,7 +205,7 @@
     <string name="battery_insight_alarm_low_desc">Lütfen cihazınızı şarja takın.</string>
     <string name="battery_insight_alarm_limit_title">Şarj Limiti Ulaşıldı (%%%1$d)</string>
     <string name="battery_insight_alarm_limit_desc">Batarya sağlığını korumak için şarjı kesebilirsiniz.</string>
-    <string name="battery_insight_alarm_full_title">Pil Tamamen Doldu (%100)</string>
+    <string name="battery_insight_alarm_full_title" formatted="false">Pil Tamamen Doldu (%100)</string>
     <string name="battery_insight_alarm_full_desc">Şarj aletini çıkarabilirsiniz.</string>
     <string name="battery_insight_capacity_health_label">Kapasite Sağlığı</string>
     <string name="battery_insight_cycle_health_label">Döngü Sağlığı</string>
@@ -257,4 +257,17 @@
     <string name="battery_insight_update_notify_desc">%1$s sürümü indirilmeye hazır. Değişiklikleri görmek ve kurmak için dokunun.</string>
     <string name="battery_insight_channel_updates">Uygulama Güncellemeleri</string>
     <string name="battery_insight_channel_updates_desc">Yeni BatteryInsight sürümleri için bildirimler</string>
+    <string name="battery_insight_section_appearance">Görünüm</string>
+    <string name="battery_insight_theme_amoled_summary">Karanlık modda tamamen siyah arka plan kullan</string>
+    <string name="battery_insight_theme_monet_summary">Duvar kâğıdınızdan alınan renkleri kullan (Material You)</string>
+    <string name="battery_insight_theme_liquid_glass_summary">Standart menü yerine yüzen yarı saydam gezinme çubuğu</string>
+    <string name="battery_insight_health_good">İyi</string>
+    <string name="battery_insight_health_overheat">Aşırı ısınma</string>
+    <string name="battery_insight_health_dead">Ölü</string>
+    <string name="battery_insight_health_over_voltage">Aşırı voltaj</string>
+    <string name="battery_insight_health_cold">Soğuk</string>
+    <string name="battery_insight_health_failure">Arıza</string>
+    <string name="battery_insight_update_err_size">İndirme eksik tamamlandı, lütfen tekrar deneyin</string>
+    <string name="battery_insight_update_err_package">İndirilen dosya geçerli bir BatteryInsight güncellemesi değil</string>
+    <string name="battery_insight_update_err_signature">Güncelleme, yüklü uygulamadan farklı bir anahtarla imzalanmış</string>
 </resources>

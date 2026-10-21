@@ -9,7 +9,7 @@ import android.os.Parcel;
 import android.os.Parcelable;
 
 public class BatteryInsightHistoryBucket implements Parcelable {
-    /** UTC epoch day (millis / 86_400_000) so hour 0 on different days stay distinct. */
+    /** Local-time epoch day (LocalDate.toEpochDay) so hour 0 on different days stay distinct. */
     public int epochDay;
     public int hour;
     public long screenOnMs;
@@ -30,6 +30,19 @@ public class BatteryInsightHistoryBucket implements Parcelable {
     public BatteryInsightHistoryBucket(int epochDay, int hour) {
         this.epochDay = epochDay;
         this.hour = hour;
+    }
+
+    public BatteryInsightHistoryBucket copy() {
+        BatteryInsightHistoryBucket b = new BatteryInsightHistoryBucket(epochDay, hour);
+        b.screenOnMs = screenOnMs;
+        b.drainPercent = drainPercent;
+        b.hourlyDrainPercent = hourlyDrainPercent;
+        b.hourlyScreenOnMs = hourlyScreenOnMs;
+        b.minCurrent = minCurrent;
+        b.maxCurrent = maxCurrent;
+        b.avgCurrent = avgCurrent;
+        b.temp = temp;
+        return b;
     }
 
     protected BatteryInsightHistoryBucket(Parcel in) {

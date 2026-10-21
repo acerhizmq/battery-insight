@@ -5,6 +5,9 @@
 
 package com.acer.batteryinsight.ui.components
 
+import com.acer.batteryinsight.ui.utils.localizedHealth
+import androidx.compose.ui.platform.LocalContext
+
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
@@ -338,7 +341,7 @@ private fun ExpandedHealthPanel(
                     )
                     HealthMetric(
                         label = stringResource(R.string.battery_insight_status),
-                        value = stats.health ?: stringResource(R.string.battery_insight_unknown),
+                        value = localizedHealth(LocalContext.current, stats.health),
                     )
                 }
 

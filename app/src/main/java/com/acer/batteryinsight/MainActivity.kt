@@ -17,6 +17,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
 import com.acer.batteryinsight.ui.BatteryInsightRoot
 import com.acer.batteryinsight.ui.BatteryInsightViewModel
@@ -68,15 +70,15 @@ class MainActivity : ComponentActivity() {
 
         handleUpdateIntent(intent)
 
-        val isAmoled = prefs.getBoolean("battery_insight_amoled_mode", false)
-
         setContent {
+            val isAmoled by viewModel.amoledMode.collectAsState()
+            val dynamicColor by viewModel.dynamicColor.collectAsState()
             androidx.compose.runtime.CompositionLocalProvider(
                 androidx.compose.ui.platform.LocalLifecycleOwner provides this
             ) {
                 BatteryInsightTheme(
                     amoledMode = isAmoled,
-                    dynamicColor = true
+                    dynamicColor = dynamicColor
                 ) {
                     BatteryInsightRoot(viewModel = viewModel)
                 }

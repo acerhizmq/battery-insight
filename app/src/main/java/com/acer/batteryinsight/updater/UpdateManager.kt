@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -13,8 +14,8 @@ import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import com.acer.batteryinsight.BuildConfig
-import com.acer.batteryinsight.MainActivity
 import com.acer.batteryinsight.R
+import com.acer.batteryinsight.utils.IconUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -126,41 +127,40 @@ object UpdateManager {
         return false
     }
 
+    class UpdateVerificationException(message: String) : Exception(message)
+
     suspend fun downloadApk(
         context: Context,
         downloadUrl: String,
         versionName: String,
+        expectedSize: Long = 0L,
         onProgress: (progress: Int, downloadedBytes: Long, totalBytes: Long) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
+        val updateDir = File(context.cacheDir, "updates").apply { mkdirs() }
+        val outputFile = File(updateDir, "BatteryInsight-v$versionName.apk")
+        val partFile = File(updateDir, "BatteryInsight-v$versionName.apk.part")
         try {
-            val updateDir = File(context.cacheDir, "updates").apply { mkdirs() }
-            val outputFile = File(updateDir, "BatteryInsight-v$versionName.apk")
+            // Remove leftovers of older downloads.
+            updateDir.listFiles()?.forEach { if (it != outputFile && it != partFile) it.delete() }
 
-            val url = URL(downloadUrl)
-            var connection = url.openConnection() as HttpURLConnection
-            connection.instanceFollowRedirects = true
-            connection.connectTimeout = 15000
-            connection.readTimeout = 15000
-            connection.setRequestProperty("User-Agent", "BatteryInsight-Android/${BuildConfig.VERSION_NAME}")
-
-            var redirect = false
+            // GitHub redirects to its CDN over HTTPS; HttpURLConnection follows same-protocol redirects.
+            val connection = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = true
+                connectTimeout = 15000
+                readTimeout = 15000
+                setRequestProperty("User-Agent", "BatteryInsight-Android/${BuildConfig.VERSION_NAME}")
+            }
             val status = connection.responseCode
-            if (status == HttpURLConnection.HTTP_MOVED_TEMP || status == HttpURLConnection.HTTP_MOVED_PERM || status == 307 || status == 308) {
-                redirect = true
-            }
-
-            if (redirect) {
-                val newUrl = connection.getHeaderField("Location")
+            if (status != HttpURLConnection.HTTP_OK) {
                 connection.disconnect()
-                connection = URL(newUrl).openConnection() as HttpURLConnection
-                connection.setRequestProperty("User-Agent", "BatteryInsight-Android/${BuildConfig.VERSION_NAME}")
+                throw Exception("HTTP $status")
             }
 
-            val totalBytes = connection.contentLength.toLong()
+            val totalBytes = connection.contentLengthLong.takeIf { it > 0 } ?: expectedSize
             var downloadedBytes = 0L
 
             connection.inputStream.use { input: InputStream ->
-                FileOutputStream(outputFile).use { output ->
+                FileOutputStream(partFile).use { output ->
                     val buffer = ByteArray(8 * 1024)
                     var bytesRead: Int
                     var lastReportTime = 0L
@@ -181,10 +181,50 @@ object UpdateManager {
                     output.flush()
                 }
             }
+            connection.disconnect()
 
+            if (expectedSize > 0 && downloadedBytes != expectedSize) {
+                throw UpdateVerificationException(context.getString(R.string.battery_insight_update_err_size))
+            }
+            verifyApk(context, partFile)
+
+            outputFile.delete()
+            if (!partFile.renameTo(outputFile)) {
+                partFile.copyTo(outputFile, overwrite = true)
+                partFile.delete()
+            }
             Result.success(outputFile)
         } catch (e: Exception) {
+            partFile.delete()
             Result.failure(e)
+        }
+    }
+
+    /**
+     * Rejects archives that are not an update of this app: different package name or a signing
+     * certificate that does not match the installed one (the installer would refuse it anyway).
+     */
+    private fun verifyApk(context: Context, apk: File) {
+        val pm = context.packageManager
+        @Suppress("DEPRECATION")
+        val archive = pm.getPackageArchiveInfo(apk.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES)
+            ?: throw UpdateVerificationException(context.getString(R.string.battery_insight_update_err_package))
+        if (archive.packageName != context.packageName) {
+            throw UpdateVerificationException(context.getString(R.string.battery_insight_update_err_package))
+        }
+        val archiveSigners = archive.signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+        @Suppress("DEPRECATION")
+        val installedSigners = try {
+            pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+                .signingInfo?.apkContentsSigners?.map { it.toByteArray().contentHashCode() }
+        } catch (_: Exception) {
+            null
+        }
+        // Only compare when both sides could be read; some ROMs return no signing info for archives.
+        if (!archiveSigners.isNullOrEmpty() && !installedSigners.isNullOrEmpty() &&
+            archiveSigners.toSet() != installedSigners.toSet()
+        ) {
+            throw UpdateVerificationException(context.getString(R.string.battery_insight_update_err_signature))
         }
     }
 
@@ -251,7 +291,8 @@ object UpdateManager {
                 changelog = json.getString("changelog"),
                 downloadUrl = downloadUrl,
                 apkSize = json.getLong("apkSize"),
-                isUpdateAvailable = json.getBoolean("isUpdateAvailable")
+                // Re-evaluate: the cached entry may predate an update that is installed now.
+                isUpdateAvailable = isNewerVersion(BuildConfig.VERSION_NAME, json.getString("latestVersion"))
             )
         } catch (e: Exception) {
             null
@@ -291,8 +332,9 @@ object UpdateManager {
             notificationManager.createNotificationChannel(channel)
         }
 
-        val launchIntent = Intent(context, MainActivity::class.java).apply {
-            action = Intent.ACTION_VIEW
+        // Resolve through the enabled launcher component: MainActivity itself is disabled while
+        // the Monet icon alias is active.
+        val launchIntent = IconUtils.launchIntent(context).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_CHECK_UPDATE, true)
         }

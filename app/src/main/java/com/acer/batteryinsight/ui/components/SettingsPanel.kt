@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.dp
 import com.acer.batteryinsight.R
 import com.acer.batteryinsight.ui.BatteryInsightViewModel
 import com.acer.batteryinsight.ui.utils.alarmFrequencyLabels
+import com.acer.batteryinsight.ui.utils.notificationIconStyleLabels
 import com.acer.batteryinsight.ui.utils.getRingtoneName
 
 @Composable
@@ -86,14 +87,20 @@ fun SettingsPanel(
     val zeroCurrentAlarmEnabled by viewModel.zeroCurrentAlarmEnabled.collectAsState()
     val alarmSound by viewModel.batteryAlarmSound.collectAsState()
     val alarmVibrate by viewModel.batteryAlarmVibrate.collectAsState()
+    val amoledMode by viewModel.amoledMode.collectAsState()
+    val dynamicColor by viewModel.dynamicColor.collectAsState()
+    val liquidGlass by viewModel.liquidGlass.collectAsState()
+    val notifIconStyle by viewModel.notifIconStyle.collectAsState()
 
     var showIntervalDialog by remember { mutableStateOf(false) }
     var showResetLevelDialog by remember { mutableStateOf(false) }
     var showResetConfirmDialog by remember { mutableStateOf(false) }
     var showAlarmFreqDialog by remember { mutableStateOf(false) }
+    var showIconStyleDialog by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val freqLabels = remember { alarmFrequencyLabels(context) }
+    val iconStyleLabels = remember { notificationIconStyleLabels(context) }
     var isMonetIconEnabled by remember { mutableStateOf(IconUtils.isMonetIconEnabled(context)) }
 
     Column(
@@ -142,6 +149,31 @@ fun SettingsPanel(
 
         Spacer(Modifier.height(14.dp))
 
+        GroupCard(title = stringResource(R.string.battery_insight_section_appearance)) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                ToggleRow(
+                    title = stringResource(R.string.battery_insight_theme_monet),
+                    summary = stringResource(R.string.battery_insight_theme_monet_summary),
+                    checked = dynamicColor,
+                    onToggle = { viewModel.setDynamicColor(it) },
+                )
+            }
+            ToggleRow(
+                title = stringResource(R.string.battery_insight_theme_amoled),
+                summary = stringResource(R.string.battery_insight_theme_amoled_summary),
+                checked = amoledMode,
+                onToggle = { viewModel.setAmoledMode(it) },
+            )
+            ToggleRow(
+                title = stringResource(R.string.battery_insight_theme_liquid_glass),
+                summary = stringResource(R.string.battery_insight_theme_liquid_glass_summary),
+                checked = liquidGlass,
+                onToggle = { viewModel.setLiquidGlass(it) },
+            )
+        }
+
+        Spacer(Modifier.height(14.dp))
+
         GroupCard(title = stringResource(R.string.battery_insight_section_permission_mode)) {
             ListItem(
                 headlineContent = {
@@ -183,6 +215,29 @@ fun SettingsPanel(
                 checked = isNotifEnabled,
                 enabled = isEnabled,
                 onToggle = { viewModel.setNotifEnabled(it) },
+            )
+            ListItem(
+                headlineContent = {
+                    Text(
+                        stringResource(R.string.battery_insight_notif_icon),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                },
+                supportingContent = {
+                    Text(
+                        iconStyleLabels.getOrElse(notifIconStyle) { iconStyleLabels.first() },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                trailingContent = {
+                    Icon(
+                        Icons.Rounded.ChevronRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                modifier = Modifier.clickable(enabled = isEnabled && isNotifEnabled) { showIconStyleDialog = true },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
             )
         }
 
@@ -574,6 +629,19 @@ fun SettingsPanel(
             },
         )
     }
+
+    if (showIconStyleDialog) {
+        AlarmFrequencyDialog(
+            current = notifIconStyle,
+            labels = iconStyleLabels,
+            title = stringResource(R.string.battery_insight_notif_icon),
+            onDismiss = { showIconStyleDialog = false },
+            onSelect = {
+                viewModel.setNotifIconStyle(it)
+                showIconStyleDialog = false
+            },
+        )
+    }
 }
 
 @Composable
@@ -660,10 +728,11 @@ private fun AlarmFrequencyDialog(
     labels: List<String>,
     onDismiss: () -> Unit,
     onSelect: (Int) -> Unit,
+    title: String = stringResource(R.string.battery_insight_alarm_frequency_title),
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.battery_insight_alarm_frequency_title)) },
+        title = { Text(title) },
         text = {
             Column {
                 labels.forEachIndexed { index, label ->
