@@ -190,6 +190,25 @@ class BatteryInsightViewModel : ViewModel() {
         uiPrefs?.edit()?.putBoolean(PREF_LIQUID_GLASS, v)?.apply()
     }
 
+    private val _rootKeepAlive = MutableStateFlow(
+        uiPrefs?.getBoolean(com.acer.batteryinsight.service.RootKeepAlive.PREF_ENABLED, true) ?: true
+    )
+    val rootKeepAlive: StateFlow<Boolean> = _rootKeepAlive.asStateFlow()
+
+    fun setRootKeepAlive(v: Boolean) {
+        _rootKeepAlive.value = v
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val s = connectService()
+                if (s != null) {
+                    s.setRootKeepAliveEnabled(v)
+                } else {
+                    uiPrefs?.edit()?.putBoolean(com.acer.batteryinsight.service.RootKeepAlive.PREF_ENABLED, v)?.apply()
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
     fun setNotifIconStyle(v: Int) {
         _notifIconStyle.value = v
         viewModelScope.launch(Dispatchers.IO) {
@@ -232,10 +251,24 @@ class BatteryInsightViewModel : ViewModel() {
         }
 
         override fun onServiceDisconnected(name: android.content.ComponentName?) {
+            // The monitor process died; BIND_AUTO_CREATE reconnects once it is restarted.
             service = null
             _isServiceConnected.value = false
         }
+
+        override fun onBindingDied(name: android.content.ComponentName?) {
+            service = null
+            _isServiceConnected.value = false
+            bindRequested = false
+            try {
+                com.acer.batteryinsight.BatteryInsightApp.instance?.unbindService(this)
+            } catch (_: Exception) {}
+        }
     }
+
+    // The service runs in the separate ":monitor" process, so it is reached through binding.
+    @Volatile
+    private var bindRequested = false
 
     private fun connectService(): IBatteryInsightService? {
         service?.let { return it }
@@ -246,11 +279,11 @@ class BatteryInsightViewModel : ViewModel() {
             return local
         }
         val ctx = com.acer.batteryinsight.BatteryInsightApp.instance
-        if (ctx != null) {
+        if (ctx != null && !bindRequested) {
             try {
                 val intent = android.content.Intent(ctx, com.acer.batteryinsight.service.BatteryInsightService::class.java)
                 androidx.core.content.ContextCompat.startForegroundService(ctx, intent)
-                ctx.bindService(intent, serviceConnection, android.content.Context.BIND_AUTO_CREATE)
+                bindRequested = ctx.bindService(intent, serviceConnection, android.content.Context.BIND_AUTO_CREATE)
             } catch (_: Exception) {}
         }
         return null
@@ -308,6 +341,7 @@ class BatteryInsightViewModel : ViewModel() {
         try {
             com.acer.batteryinsight.BatteryInsightApp.instance?.unbindService(serviceConnection)
         } catch (_: Exception) {}
+        bindRequested = false
     }
 
     private suspend fun refreshData(tick: Int) = withContext(Dispatchers.IO) {
@@ -374,8 +408,11 @@ class BatteryInsightViewModel : ViewModel() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "refreshData failed", e)
-            service = null
-            _isServiceConnected.value = false
+            // Drop the reference only if the remote process is gone; the binding reconnects then.
+            if (s.asBinder()?.isBinderAlive != true) {
+                service = null
+                _isServiceConnected.value = false
+            }
         }
     }
 

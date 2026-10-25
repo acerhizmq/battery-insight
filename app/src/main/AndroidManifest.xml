@@ -63,8 +63,12 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- The monitor runs in its own lightweight process: under memory pressure (games, heavy
+             load) the low memory killer picks the heaviest process, which used to be the shared
+             UI + service process. Receivers live with it so they see the same preferences. -->
         <service
             android:name=".service.BatteryInsightService"
+            android:process=":monitor"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="specialUse|dataSync">
@@ -75,6 +79,7 @@
 
         <receiver
             android:name=".service.BootReceiver"
+            android:process=":monitor"
             android:enabled="true"
             android:exported="true">
             <intent-filter android:priority="999">
@@ -87,6 +92,7 @@
 
         <receiver
             android:name=".service.WatchdogReceiver"
+            android:process=":monitor"
             android:enabled="true"
             android:exported="false" />
 

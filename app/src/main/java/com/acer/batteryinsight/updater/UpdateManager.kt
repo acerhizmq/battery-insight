@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import com.acer.batteryinsight.BuildConfig
 import com.acer.batteryinsight.R
+import com.acer.batteryinsight.ui.utils.MarkdownParser
 import com.acer.batteryinsight.utils.IconUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -354,7 +355,7 @@ object UpdateManager {
             )
             .setStyle(
                 NotificationCompat.BigTextStyle().bigText(
-                    "${updateInfo.releaseTitle}\n\n${updateInfo.changelog}"
+                    "${updateInfo.releaseTitle}\n\n${MarkdownParser.toPlainText(updateInfo.changelog)}"
                 )
             )
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)

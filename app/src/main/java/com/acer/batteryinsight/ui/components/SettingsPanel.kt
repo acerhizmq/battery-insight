@@ -23,7 +23,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
+import com.acer.batteryinsight.utils.ExitReasonTracker
 import com.acer.batteryinsight.utils.IconUtils
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.MusicNote
@@ -91,12 +94,14 @@ fun SettingsPanel(
     val dynamicColor by viewModel.dynamicColor.collectAsState()
     val liquidGlass by viewModel.liquidGlass.collectAsState()
     val notifIconStyle by viewModel.notifIconStyle.collectAsState()
+    val rootKeepAlive by viewModel.rootKeepAlive.collectAsState()
 
     var showIntervalDialog by remember { mutableStateOf(false) }
     var showResetLevelDialog by remember { mutableStateOf(false) }
     var showResetConfirmDialog by remember { mutableStateOf(false) }
     var showAlarmFreqDialog by remember { mutableStateOf(false) }
     var showIconStyleDialog by remember { mutableStateOf(false) }
+    var showExitReasonsDialog by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val freqLabels = remember { alarmFrequencyLabels(context) }
@@ -201,6 +206,12 @@ fun SettingsPanel(
                     headlineColor = MaterialTheme.colorScheme.onSurface,
                     supportingColor = MaterialTheme.colorScheme.onSurfaceVariant,
                 ),
+            )
+            ToggleRow(
+                title = stringResource(R.string.battery_insight_root_keepalive_title),
+                summary = stringResource(R.string.battery_insight_root_keepalive_summary),
+                checked = rootKeepAlive,
+                onToggle = { viewModel.setRootKeepAlive(it) },
             )
         }
 
@@ -411,6 +422,34 @@ fun SettingsPanel(
                     )
                 },
                 modifier = Modifier.clickable { showResetConfirmDialog = true },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+            )
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        GroupCard(title = stringResource(R.string.battery_insight_section_diagnostics)) {
+            ListItem(
+                headlineContent = {
+                    Text(
+                        stringResource(R.string.battery_insight_exit_reasons_title),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                },
+                supportingContent = {
+                    Text(
+                        stringResource(R.string.battery_insight_exit_reasons_summary),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                trailingContent = {
+                    Icon(
+                        Icons.Rounded.ChevronRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                modifier = Modifier.clickable { showExitReasonsDialog = true },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
             )
         }
@@ -630,6 +669,10 @@ fun SettingsPanel(
         )
     }
 
+    if (showExitReasonsDialog) {
+        ExitReasonsDialog(onDismiss = { showExitReasonsDialog = false })
+    }
+
     if (showIconStyleDialog) {
         AlarmFrequencyDialog(
             current = notifIconStyle,
@@ -642,6 +685,41 @@ fun SettingsPanel(
             },
         )
     }
+}
+
+@Composable
+private fun ExitReasonsDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val entries = remember { ExitReasonTracker.recent(context) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.battery_insight_exit_reasons_title)) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                when {
+                    android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R ->
+                        Text(stringResource(R.string.battery_insight_exit_reasons_unsupported))
+                    entries.isEmpty() ->
+                        Text(stringResource(R.string.battery_insight_exit_reasons_empty))
+                    else -> entries.forEach { e ->
+                        Text(
+                            ExitReasonTracker.format(e),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.battery_insight_close))
+            }
+        },
+    )
 }
 
 @Composable

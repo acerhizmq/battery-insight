@@ -27,6 +27,9 @@ class BatteryInsightApp : Application() {
         // Set up LibSU root shell builder (must precede any shell creation)
         com.acer.batteryinsight.utils.ShellUtils.configure()
 
+        // The monitor process only hosts the service and its receivers; they start what they need.
+        if (getProcessName().endsWith(":monitor")) return
+
         val prefs = getSharedPreferences("battery_insight_prefs", Context.MODE_PRIVATE)
         val isOnboardingCompleted = prefs.getBoolean("onboarding_completed", false)
 
@@ -41,6 +44,14 @@ class BatteryInsightApp : Application() {
                     ContextCompat.startForegroundService(this, intent)
                 } catch (_: Exception) {}
             }
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // Keep the UI process small once it is no longer visible.
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            com.acer.batteryinsight.ui.components.clearAppIconCache()
         }
     }
 }

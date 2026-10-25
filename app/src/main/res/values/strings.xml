@@ -270,4 +270,16 @@
     <string name="battery_insight_update_err_size">Download incomplete, please try again</string>
     <string name="battery_insight_update_err_package">Downloaded file is not a valid BatteryInsight update</string>
     <string name="battery_insight_update_err_signature">Update is signed with a different key than the installed app</string>
+    <string name="battery_insight_root_keepalive_title">Keep alive with root</string>
+    <string name="battery_insight_root_keepalive_summary">If the system closes the app, a root watchdog restarts it within 30 s. On HyperOS/MIUI the app is also exempted from background restrictions.</string>
+    <string name="battery_insight_section_diagnostics">Diagnostics</string>
+    <string name="battery_insight_exit_reasons_title">Recent shutdown reasons</string>
+    <string name="battery_insight_exit_reasons_summary">Shows why the system stopped the app</string>
+    <string name="battery_insight_exit_reasons_empty">No recorded shutdowns</string>
+    <string name="battery_insight_exit_reasons_unsupported">Requires Android 11 or newer</string>
+    <string name="battery_insight_md_note">Note</string>
+    <string name="battery_insight_md_tip">Tip</string>
+    <string name="battery_insight_md_important">Important</string>
+    <string name="battery_insight_md_warning">Warning</string>
+    <string name="battery_insight_md_caution">Caution</string>
 </resources>

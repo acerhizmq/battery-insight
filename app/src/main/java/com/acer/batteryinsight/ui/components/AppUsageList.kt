@@ -54,6 +54,11 @@ import com.acer.batteryinsight.R
 
 private val appIconCache = LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(120)
 
+/** Drops cached app icons; called when the UI process is trimmed. */
+fun clearAppIconCache() {
+    appIconCache.evictAll()
+}
+
 @Composable
 fun AppUsageSummaryCard(
     totalMah: Double,

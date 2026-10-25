@@ -73,7 +73,7 @@ fun UpdateDialog(
 
     val dialogScrollState = rememberScrollState()
     val changelogScrollState = rememberScrollState()
-    val changelogMaxHeight = (screenHeight * 0.22f).coerceIn(60.dp, 160.dp)
+    val changelogMaxHeight = (screenHeight * 0.34f).coerceIn(80.dp, 280.dp)
 
     val btnFontSize = if (isCompact) 12.sp else 13.sp
     val btnPadding = PaddingValues(horizontal = if (isCompact) 10.dp else 16.dp, vertical = 8.dp)
@@ -164,8 +164,9 @@ fun UpdateDialog(
                             .padding(10.dp)
                             .verticalScroll(changelogScrollState),
                     ) {
-                        Text(
-                            text = updateInfo.changelog.ifBlank { "Minor bug fixes and performance improvements." },
+                        // Release notes are GitHub Markdown; render them like GitHub does.
+                        MarkdownText(
+                            markdown = updateInfo.changelog.ifBlank { "Minor bug fixes and performance improvements." },
                             style = MaterialTheme.typography.bodySmall.copy(
                                 lineHeight = if (fontScale > 1.15f) 16.sp else 18.sp,
                                 fontSize = if (fontScale > 1.15f) 11.sp else 12.sp,

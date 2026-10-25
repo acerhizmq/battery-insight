@@ -270,4 +270,16 @@
     <string name="battery_insight_update_err_size">İndirme eksik tamamlandı, lütfen tekrar deneyin</string>
     <string name="battery_insight_update_err_package">İndirilen dosya geçerli bir BatteryInsight güncellemesi değil</string>
     <string name="battery_insight_update_err_signature">Güncelleme, yüklü uygulamadan farklı bir anahtarla imzalanmış</string>
+    <string name="battery_insight_root_keepalive_title">Root ile kesintisiz çalışma</string>
+    <string name="battery_insight_root_keepalive_summary">Sistem uygulamayı kapatırsa root bekçisi 30 sn içinde yeniden başlatır. HyperOS/MIUI\'da uygulamayı arka plan kısıtlamalarından da muaf tutar.</string>
+    <string name="battery_insight_section_diagnostics">Tanılama</string>
+    <string name="battery_insight_exit_reasons_title">Son kapanma nedenleri</string>
+    <string name="battery_insight_exit_reasons_summary">Sistemin uygulamayı neden kapattığını gösterir</string>
+    <string name="battery_insight_exit_reasons_empty">Kayıtlı kapanma yok</string>
+    <string name="battery_insight_exit_reasons_unsupported">Android 11 veya üzeri gerekir</string>
+    <string name="battery_insight_md_note">Not</string>
+    <string name="battery_insight_md_tip">İpucu</string>
+    <string name="battery_insight_md_important">Önemli</string>
+    <string name="battery_insight_md_warning">Uyarı</string>
+    <string name="battery_insight_md_caution">Dikkat</string>
 </resources>

@@ -38,8 +38,10 @@ import com.acer.batteryinsight.model.BatteryInsightFlowSample
 import com.acer.batteryinsight.model.BatteryInsightHistoryBucket
 import com.acer.batteryinsight.model.BatteryInsightStats
 import com.acer.batteryinsight.updater.UpdateManager
+import com.acer.batteryinsight.utils.ExitReasonTracker
 import com.acer.batteryinsight.utils.IconUtils
 import com.acer.batteryinsight.utils.ShellUtils
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -80,6 +82,9 @@ class BatteryInsightService : Service() {
         private const val WATCHDOG_INTERVAL_MS = 5 * 60 * 1000L
         private const val IMMORTALITY_INTERVAL_MS = 30 * 60 * 1000L
         private const val APP_USAGE_REFRESH_MS = 2 * 60 * 1000L
+        private const val APP_USAGE_RETRY_MS = 30 * 1000L
+        // Upper bound on dumpsys lines kept in memory; the power section is a few hundred lines.
+        private const val DUMPSYS_MAX_LINES = 1500
         private const val ZERO_CURRENT_MAX_MA = 5
         private const val ZERO_CURRENT_SUSTAIN_MS = 20_000L
 
@@ -91,13 +96,19 @@ class BatteryInsightService : Service() {
             private set
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // Without a handler, any exception (or Error such as OOM) escaping a launched coroutine is
+    // rethrown on the worker thread and kills the whole process.
+    private val coroutineErrorHandler = CoroutineExceptionHandler { _, e ->
+        Log.e(TAG, "Uncaught error in service coroutine", e)
+    }
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + coroutineErrorHandler)
 
     // All mutable session state is touched from this single thread (broadcasts + monitor loop),
     // and additionally guarded by mCurrentStats for binder callers.
     private val stateExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "BatteryInsightState") }
     private val stateDispatcher = stateExecutor.asCoroutineDispatcher()
     private var monitorJob: Job? = null
+    @Volatile private var isInForeground = false
 
     private lateinit var prefs: SharedPreferences
     private lateinit var notifManager: NotificationManager
@@ -241,8 +252,14 @@ class BatteryInsightService : Service() {
 
         override fun isEnabled(): Boolean = prefs.getBoolean("battery_insight_enabled", true)
         override fun setEnabled(enabled: Boolean) {
-            prefs.edit().putBoolean("battery_insight_enabled", enabled).apply()
+            prefs.edit().putBoolean("battery_insight_enabled", enabled).commit()
             if (enabled) forceNotificationUpdate() else notifManager.cancel(NOTIF_ID)
+            applyRootKeepAlive()
+        }
+
+        override fun setRootKeepAliveEnabled(enabled: Boolean) {
+            prefs.edit().putBoolean(RootKeepAlive.PREF_ENABLED, enabled).commit()
+            applyRootKeepAlive()
         }
 
         override fun isNotificationEnabled(): Boolean = prefs.getBoolean("battery_insight_notif_enabled", true)
@@ -391,6 +408,7 @@ class BatteryInsightService : Service() {
             }
 
             createNotificationChannels()
+            ExitReasonTracker.logRecent(this)
             synchronized(mCurrentStats) {
                 loadSettingsIntoStats()
                 restoreSessionState()
@@ -445,6 +463,7 @@ class BatteryInsightService : Service() {
                         scope.launch(Dispatchers.IO) {
                             detectHardwarePaths()
                             applyRootImmortality()
+                            applyRootKeepAlive()
                             synchronized(mCurrentStats) { fillStatsLocked(recordSample = false) }
                         }
                     }
@@ -727,6 +746,18 @@ class BatteryInsightService : Service() {
         }
     }
 
+    /** Starts or stops the out-of-process root watchdog to match the current settings. */
+    private fun applyRootKeepAlive() {
+        scope.launch(Dispatchers.IO) {
+            if (RootKeepAlive.isWanted(this@BatteryInsightService)) {
+                RootKeepAlive.ensureRunning(this@BatteryInsightService)
+                RootKeepAlive.applyOemExemptions(this@BatteryInsightService)
+            } else {
+                RootKeepAlive.stop(this@BatteryInsightService)
+            }
+        }
+    }
+
     private fun watchdogPendingIntent(): PendingIntent {
         val intent = Intent(this, WatchdogReceiver::class.java).apply { action = WATCHDOG_ACTION }
         return PendingIntent.getBroadcast(
@@ -767,6 +798,7 @@ class BatteryInsightService : Service() {
             } else {
                 startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             }
+            isInForeground = true
             true
         } catch (e: Exception) {
             Log.e(TAG, "Error in startForegroundSafely", e)
@@ -787,7 +819,9 @@ class BatteryInsightService : Service() {
                 resetStatsInternal("Reset on device reboot")
             }
         }
-        if (!startForegroundSafely()) {
+        // A repeated start of an already-foreground service must never stop it: a failed
+        // re-promotion (e.g. requested from the background) leaves the existing foreground state intact.
+        if (!startForegroundSafely() && !isInForeground) {
             stopSelf()
             return START_NOT_STICKY
         }
@@ -1246,6 +1280,8 @@ class BatteryInsightService : Service() {
                         lastWatchdogTime = now
                         scheduleWatchdog()
                         checkBackgroundUpdates(0L)
+                        // PowerKeeper may regenerate its exemption list; re-check periodically.
+                        applyRootKeepAlive()
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in monitor loop", e)
@@ -1303,7 +1339,10 @@ class BatteryInsightService : Service() {
     // region App usage
 
     private fun maybeRefreshAppUsages() {
-        val stale = mAppUsages.isEmpty() || System.currentTimeMillis() - lastAppUsageFetchMs >= APP_USAGE_REFRESH_MS
+        // Throttle even while empty: if parsing yields nothing on a device, retrying on every UI
+        // poll would run dumpsys back to back.
+        val minGap = if (mAppUsages.isEmpty()) APP_USAGE_RETRY_MS else APP_USAGE_REFRESH_MS
+        val stale = System.currentTimeMillis() - lastAppUsageFetchMs >= minGap
         if (stale && appUsageFetchInFlight.compareAndSet(false, true)) {
             scope.launch {
                 try {
@@ -1326,7 +1365,7 @@ class BatteryInsightService : Service() {
         else -> -7 to getString(R.string.battery_insight_subsystem_audio)
     }
 
-    private suspend fun fetchAppUsages() = withContext(Dispatchers.IO) {
+    private suspend fun fetchAppUsages(): Unit = withContext(Dispatchers.IO) {
         try {
             val pm = packageManager
             val appMap = cachedAppMap
@@ -1368,10 +1407,12 @@ class BatteryInsightService : Service() {
                 }
             } catch (_: Exception) {}
 
-            // Filter in the shell to avoid allocating the whole (tens of MB) dumpsys output.
-            var lines = ShellUtils.exec("dumpsys batterystats --charged | grep -E -A 400 'Estimated (power|battery) use' || dumpsys batterystats --charged")
+            // Filter and cap in the shell: the full batterystats dump can be tens of MB, and falling
+            // back to it (when the header differs) exhausted memory and crashed the process.
+            val filter = "grep -i -E -A 400 'Estimated (power|battery) use' | head -n $DUMPSYS_MAX_LINES"
+            var lines = ShellUtils.exec("dumpsys batterystats --charged 2>/dev/null | $filter")
             if (lines.none { it.contains("Estimated", ignoreCase = true) }) {
-                lines = ShellUtils.exec("dumpsys batterystats | grep -E -A 400 'Estimated (power|battery) use' || dumpsys batterystats")
+                lines = ShellUtils.exec("dumpsys batterystats 2>/dev/null | $filter")
             }
 
             val totalCapacity = synchronized(mCurrentStats) { mCurrentStats.totalCapacity }
@@ -1480,7 +1521,9 @@ class BatteryInsightService : Service() {
                     mAppUsages.addAll(result)
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Throwable) {
+            Log.e(TAG, "App usage refresh failed", e)
+        }
     }
 
     // endregion
