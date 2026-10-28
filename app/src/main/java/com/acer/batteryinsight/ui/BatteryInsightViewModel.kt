@@ -19,7 +19,8 @@ import com.acer.batteryinsight.ui.components.UpdateDownloadState
 import com.acer.batteryinsight.updater.AppUpdateInfo
 import com.acer.batteryinsight.updater.UpdateManager
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,6 +31,12 @@ import java.io.File
 class BatteryInsightViewModel : ViewModel() {
     companion object {
         private const val TAG = "BatteryInsightVM"
+        private const val LIVE_POLL_MS = 1000L
+        private const val CONNECT_RETRY_MS = 150L
+        private const val FLOW_REFRESH_MS = 2000L
+        private const val HISTORY_REFRESH_MS = 30_000L
+        private const val APPS_REFRESH_MS = 60_000L
+        private const val ARCHIVE_REFRESH_MS = 15_000L
         const val PREF_AMOLED = "battery_insight_amoled_mode"
         const val PREF_DYNAMIC_COLOR = "battery_insight_dynamic_color"
         const val PREF_LIQUID_GLASS = "battery_insight_liquid_glass"
@@ -93,7 +100,7 @@ class BatteryInsightViewModel : ViewModel() {
     private val _lastDischargeHistory = MutableStateFlow<List<BatteryInsightHistoryBucket>>(emptyList())
     val lastDischargeHistory: StateFlow<List<BatteryInsightHistoryBucket>> = _lastDischargeHistory.asStateFlow()
 
-    private val _isLoading = MutableStateFlow(false)
+    private val _isLoading = MutableStateFlow(true)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     private val _isServiceConnected = MutableStateFlow(false)
@@ -225,21 +232,22 @@ class BatteryInsightViewModel : ViewModel() {
 
     private var hasLoadedSettings = false
 
+    // Wakes the polling loop early (e.g. as soon as the service connects).
+    private val refreshSignal = Channel<Unit>(Channel.CONFLATED)
+    @Volatile private var lastFlowFetchMs = 0L
+    @Volatile private var lastHistoryFetchMs = 0L
+    @Volatile private var lastAppsFetchMs = 0L
+    @Volatile private var lastArchiveFetchMs = 0L
+
+    private fun resetFetchTimes() {
+        lastFlowFetchMs = 0L
+        lastHistoryFetchMs = 0L
+        lastAppsFetchMs = 0L
+        lastArchiveFetchMs = 0L
+    }
+
     private var pollingJob: kotlinx.coroutines.Job? = null
 
-    init {
-        try {
-            val ctx = com.acer.batteryinsight.BatteryInsightApp.instance
-            val prefs = ctx?.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE)
-            if (prefs?.getBoolean("onboarding_completed", false) == true) {
-                com.acer.batteryinsight.utils.ShellUtils.initRootShell()
-                startPolling()
-            }
-            checkForUpdates(isManual = false)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error initializing ViewModel", e)
-        }
-    }
 
     private val serviceConnection = object : android.content.ServiceConnection {
         override fun onServiceConnected(name: android.content.ComponentName?, binder: android.os.IBinder?) {
@@ -247,6 +255,9 @@ class BatteryInsightViewModel : ViewModel() {
                 service = IBatteryInsightService.Stub.asInterface(binder)
                 _isServiceConnected.value = true
                 _isLoading.value = false
+                // Load everything right away instead of waiting for the next poll.
+                resetFetchTimes()
+                refreshSignal.trySend(Unit)
             }
         }
 
@@ -269,6 +280,22 @@ class BatteryInsightViewModel : ViewModel() {
     // The service runs in the separate ":monitor" process, so it is reached through binding.
     @Volatile
     private var bindRequested = false
+
+    // Declared after everything the polling loop touches: Kotlin initializes properties in order,
+    // and startPolling() begins work immediately.
+    init {
+        try {
+            val ctx = com.acer.batteryinsight.BatteryInsightApp.instance
+            val prefs = ctx?.getSharedPreferences("battery_insight_prefs", android.content.Context.MODE_PRIVATE)
+            if (prefs?.getBoolean("onboarding_completed", false) == true) {
+                com.acer.batteryinsight.utils.ShellUtils.initRootShell()
+                startPolling()
+            }
+            checkForUpdates(isManual = false)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing ViewModel", e)
+        }
+    }
 
     private fun connectService(): IBatteryInsightService? {
         service?.let { return it }
@@ -317,20 +344,21 @@ class BatteryInsightViewModel : ViewModel() {
             } catch (_: Exception) {}
         }
         pollingJob = viewModelScope.launch {
-            var tick = 0
             val startTime = System.currentTimeMillis()
             while (true) {
+                var connected = false
                 try {
-                    refreshData(tick)
-                    if (_isServiceConnected.value || System.currentTimeMillis() - startTime > 3000) {
+                    connected = refreshData()
+                    if (connected || System.currentTimeMillis() - startTime > 3000) {
                         _isLoading.value = false
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error in polling loop", e)
                 }
-                tick++
-                val intervalMs = _monitorInterval.value.coerceIn(1000, 60000).toLong()
-                delay(intervalMs)
+                // While binding, retry quickly; onServiceConnected also wakes the loop at once.
+                // Once connected, the visible UI refreshes live, independent of the notification interval.
+                val waitMs = if (connected) LIVE_POLL_MS else CONNECT_RETRY_MS
+                withTimeoutOrNull(waitMs) { refreshSignal.receive() }
             }
         }
     }
@@ -344,13 +372,15 @@ class BatteryInsightViewModel : ViewModel() {
         bindRequested = false
     }
 
-    private suspend fun refreshData(tick: Int) = withContext(Dispatchers.IO) {
+    /** @return whether the service was reachable. */
+    private suspend fun refreshData(): Boolean = withContext(Dispatchers.IO) {
         val s = connectService()
         if (s == null) {
             _isServiceConnected.value = false
-            return@withContext
+            return@withContext false
         }
         _isServiceConnected.value = true
+        val now = System.currentTimeMillis()
         try {
             val currentStats = s.batteryState
             if (currentStats != null) {
@@ -363,23 +393,28 @@ class BatteryInsightViewModel : ViewModel() {
             }
             _isEnabled.value = s.isEnabled
 
-            // Realtime Flow: every 2nd poll
-            if (tick % 2 == 0) {
+            // Each dataset is fetched immediately after (re)connecting, then on its own cadence.
+            // Realtime flow: the service adds a sample per monitor interval, so a short cadence suffices.
+            if (now - lastFlowFetchMs >= FLOW_REFRESH_MS) {
                 _flow.value = s.getCurrentFlow(30)?.toList() ?: emptyList()
+                lastFlowFetchMs = now
             }
 
-            // Hourly History: every 20th poll
-            if (tick % 20 == 0 || _history.value.isEmpty()) {
+            // Hourly History
+            if (now - lastHistoryFetchMs >= HISTORY_REFRESH_MS || _history.value.isEmpty()) {
                 _history.value = s.history?.toList() ?: emptyList()
+                lastHistoryFetchMs = now
             }
 
             // App Usage: cheap cached read; the service throttles the actual dumpsys run to every 2 min
-            if (_apps.value.isEmpty() || tick % 6 == 0) {
+            if (_apps.value.isEmpty() || now - lastAppsFetchMs >= APPS_REFRESH_MS) {
                 _apps.value = s.getAppUsageSinceLastCharge(40)?.toList() ?: emptyList()
+                lastAppsFetchMs = now
             }
 
-            // Archived Session data: every 10th poll or when empty
-            if (tick % 10 == 0 || _lastChargeFlow.value.isEmpty()) {
+            // Archived Session data
+            if (now - lastArchiveFetchMs >= ARCHIVE_REFRESH_MS || _lastChargeFlow.value.isEmpty()) {
+                lastArchiveFetchMs = now
                 try {
                     _lastChargeFlow.value = s.getSessionFlow(1)?.toList() ?: emptyList()
                     _lastChargeHistory.value = s.getSessionHistory(1)?.toList() ?: emptyList()
@@ -406,12 +441,16 @@ class BatteryInsightViewModel : ViewModel() {
                 _batteryAlarmSound.value = currentStats.batteryAlarmSound
                 _batteryAlarmVibrate.value = currentStats.isBatteryAlarmVibrate
             }
+            true
         } catch (e: Exception) {
             Log.e(TAG, "refreshData failed", e)
             // Drop the reference only if the remote process is gone; the binding reconnects then.
             if (s.asBinder()?.isBinderAlive != true) {
                 service = null
                 _isServiceConnected.value = false
+                false
+            } else {
+                true
             }
         }
     }
