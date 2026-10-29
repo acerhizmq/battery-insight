@@ -363,7 +363,7 @@ class BatteryInsightService : Service() {
         when (intent.action) {
             Intent.ACTION_BATTERY_CHANGED -> synchronized(mCurrentStats) { handleBatteryChangedLocked(intent) }
             Intent.ACTION_POWER_CONNECTED -> synchronized(mCurrentStats) {
-                accumulateScreenTimeLocked(countAsCharging = false)
+                accumulateScreenTimeLocked()
                 isPlugged = true
                 archiveSessionLocked(isChargingSession = false)
                 segmentStartWallMs = System.currentTimeMillis()
@@ -373,7 +373,7 @@ class BatteryInsightService : Service() {
                 saveSessionState()
             }
             Intent.ACTION_POWER_DISCONNECTED -> synchronized(mCurrentStats) {
-                accumulateScreenTimeLocked(countAsCharging = true)
+                accumulateScreenTimeLocked()
                 isPlugged = false
                 zeroCurrentSinceMs = 0L
                 mCurrentStats.chargeScreenOnTime = accumChargeScreenOnMs
@@ -1000,7 +1000,10 @@ class BatteryInsightService : Service() {
         val temp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
         val health = intent.getIntExtra(BatteryManager.EXTRA_HEALTH, -1)
 
-        isPlugged = plugged != 0
+        val nowPlugged = plugged != 0
+        // Close the running interval under the old state; POWER_(DIS)CONNECTED may arrive later or not at all.
+        if (nowPlugged != isPlugged) accumulateScreenTimeLocked()
+        isPlugged = nowPlugged
         batteryStatus = status
         isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL || isPlugged
 
@@ -1058,31 +1061,33 @@ class BatteryInsightService : Service() {
     }
 
     /**
-     * Adds the time since the last screen/power transition to the screen-on/off counters.
-     * @param countAsCharging whether that interval belongs to the charging counters.
+     * Closes the interval since the last screen/power transition. Call it *before* changing
+     * isScreenOn / isPlugged, so the interval is attributed to the state it was spent in.
      */
-    private fun accumulateScreenTimeLocked(countAsCharging: Boolean) {
+    private fun accumulateScreenTimeLocked() {
         val nowRealtime = SystemClock.elapsedRealtime()
         val nowUptime = SystemClock.uptimeMillis()
         val deltaRealtime = max(0L, nowRealtime - lastScreenStateChangeRealtime)
         val deltaUptime = (nowUptime - lastScreenStateChangeUptime).coerceIn(0L, deltaRealtime)
         val deltaDeepSleep = max(0L, deltaRealtime - deltaUptime)
 
-        if (isScreenOn) {
+        // Time on the charger belongs to the charging counters only; the screen-on/off, awake and
+        // deep-sleep counters describe discharge and must not advance while plugged in.
+        if (isPlugged) {
+            if (isScreenOn) accumChargeScreenOnMs += deltaRealtime else accumChargeScreenOffMs += deltaRealtime
+        } else if (isScreenOn) {
             accumScreenOnMs += deltaRealtime
-            if (countAsCharging) accumChargeScreenOnMs += deltaRealtime
         } else {
             accumScreenOffMs += deltaRealtime
             accumAwakeMs += deltaUptime
             accumDeepSleepMs += deltaDeepSleep
-            if (countAsCharging) accumChargeScreenOffMs += deltaRealtime
         }
         lastScreenStateChangeRealtime = nowRealtime
         lastScreenStateChangeUptime = nowUptime
     }
 
     private fun handleScreenStateChangeLocked(screenOn: Boolean) {
-        accumulateScreenTimeLocked(countAsCharging = isCharging || isPlugged)
+        accumulateScreenTimeLocked()
         isScreenOn = screenOn
         saveSessionState()
     }
@@ -1110,14 +1115,16 @@ class BatteryInsightService : Service() {
         val curDeltaUp = rawDeltaUp.coerceIn(0L, curDeltaRt)
         val curDeltaDs = max(0L, curDeltaRt - curDeltaUp)
 
-        val curScreenOn = accumScreenOnMs + if (isScreenOn) curDeltaRt else 0L
-        val curScreenOff = accumScreenOffMs + if (!isScreenOn) curDeltaRt else 0L
-        val curAwake = accumAwakeMs + if (!isScreenOn) curDeltaUp else 0L
-        val curDeepSleep = accumDeepSleepMs + if (!isScreenOn) curDeltaDs else 0L
+        // Same split as accumulateScreenTimeLocked: the open interval goes to one set of counters.
+        val discharging = !isPlugged
+        val curScreenOn = accumScreenOnMs + if (discharging && isScreenOn) curDeltaRt else 0L
+        val curScreenOff = accumScreenOffMs + if (discharging && !isScreenOn) curDeltaRt else 0L
+        val curAwake = accumAwakeMs + if (discharging && !isScreenOn) curDeltaUp else 0L
+        val curDeepSleep = accumDeepSleepMs + if (discharging && !isScreenOn) curDeltaDs else 0L
 
         val chargingNow = isCharging || isPlugged
-        val curChargeScreenOn = accumChargeScreenOnMs + if (chargingNow && isScreenOn) curDeltaRt else 0L
-        val curChargeScreenOff = accumChargeScreenOffMs + if (chargingNow && !isScreenOn) curDeltaRt else 0L
+        val curChargeScreenOn = accumChargeScreenOnMs + if (isPlugged && isScreenOn) curDeltaRt else 0L
+        val curChargeScreenOff = accumChargeScreenOffMs + if (isPlugged && !isScreenOn) curDeltaRt else 0L
 
         mCurrentStats.screenOnTime = curScreenOn
         mCurrentStats.screenOffTime = curScreenOff
